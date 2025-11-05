@@ -2,7 +2,7 @@
 
 **Release Date: Wednesday, Nov 5 2025**
 
-**Due Date: Monday, Dec 1, 2025, 11:59 PM**
+**Due Date: Saturday, Nov 29, 2025, 11:59 PM**
 
 ---
 
