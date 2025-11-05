@@ -130,3 +130,6 @@ Refer to the following papers, which you can find in `canvas/files/papers/`:
 * **RPC options**: We recomment gRPC as of Spring '24. Spend time to familiarize with their usage.
   * [Google gRPC](https://grpc.io/docs/tutorials/basic/c.html)
   * [gRPC Demo](https://github.com/danieldzahka/gRPC_Demo) (Note that the cmake in advos has been updated as of Fall 2024)
+## 6. Rubric
+
+For students' convenience, we are sharing the project rubric. Please note that it might be subject to change, and any updates will be announced in advance.
