@@ -133,3 +133,5 @@ Refer to the following papers, which you can find in `canvas/files/papers/`:
 ## 6. Rubric
 
 For students' convenience, we are sharing the project rubric. Please note that it might be subject to change, and any updates will be announced in advance.
+
+![Project 4 Rubric](Advos_P4_Rubric.png)
