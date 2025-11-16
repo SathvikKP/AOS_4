@@ -2,20 +2,25 @@ CFLAGS  =
 LFLAGS  =
 CC      = g++ -std=c++11
 RM      = /bin/rm -rf
+BIN_DIR = bin
+COMMON_SRC = src/net_common.cpp src/utils.cpp
 
 TESTS = test_app manager storage
 CLIENT_SRC = src/test_app.cpp src/client.cpp
 
 all: $(TESTS)
 
-manager: src/manager.cpp
-	$(CC) -Wall src/manager.cpp -o bin/manager
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
 
-storage: src/storage.cpp
-	$(CC) -Wall src/storage.cpp -o bin/storage
+manager: src/manager.cpp $(COMMON_SRC) | $(BIN_DIR)
+	$(CC) -Wall src/manager.cpp $(COMMON_SRC) -o $(BIN_DIR)/manager
 
-test_app: 
-	$(CC) -Wall $(CLIENT_SRC) -o bin/test_app
+storage: src/storage.cpp $(COMMON_SRC) | $(BIN_DIR)
+	$(CC) -Wall src/storage.cpp $(COMMON_SRC) -o $(BIN_DIR)/storage
+
+test_app: $(CLIENT_SRC) $(COMMON_SRC) | $(BIN_DIR)
+	$(CC) -Wall $(CLIENT_SRC) $(COMMON_SRC) -o $(BIN_DIR)/test_app
 
 clean:
-	$(RM) *.o $(TESTS)
+	$(RM) *.o $(BIN_DIR)

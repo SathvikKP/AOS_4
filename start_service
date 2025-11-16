@@ -1,0 +1,78 @@
+#!/bin/bash
+
+set -e
+
+show_help() {
+    echo "Usage: $0 --nodes <count> --rep <factor>"
+    echo "Defaults: --nodes 1 --rep 1"
+    exit 1
+}
+
+NODES=1
+REPL=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --nodes)
+            shift
+            [[ $# -gt 0 ]] || show_help
+            NODES="$1"
+            ;;
+        --rep)
+            shift
+            [[ $# -gt 0 ]] || show_help
+            REPL="$1"
+            ;;
+        -h|--help)
+            show_help
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            ;;
+    esac
+    shift
+done
+
+if ! [[ "$NODES" =~ ^[0-9]+$ ]] || ! [[ "$REPL" =~ ^[0-9]+$ ]]; then
+    echo "nodes and rep must be integers"
+    exit 1
+fi
+
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+GT_DIR="$PROJECT_ROOT/gtstore"
+STATE_FILE="$GT_DIR/service_pids.txt"
+
+pushd "$GT_DIR" >/dev/null
+make >/dev/null
+mkdir -p logs
+rm -f logs/*.log "$STATE_FILE"
+
+export GTSTORE_REPL="$REPL"
+./bin/manager > logs/manager.log 2>&1 &
+MANAGER_PID=$!
+
+# give the manager time to start before storage nodes connect
+sleep 3
+
+echo "$MANAGER_PID" > "$STATE_FILE"
+STORAGE_PIDS=()
+for ((i=1; i<=NODES; ++i)); do
+    ./bin/storage > "logs/storage_${i}.log" 2>&1 &
+    pid=$!
+    STORAGE_PIDS+=("$pid")
+    echo "$pid" >> "$STATE_FILE"
+    sleep 1
+done
+
+popd >/dev/null
+
+echo "GTStore service started"
+echo "Manager PID: $MANAGER_PID"
+printf 'Storage PIDs: '
+printf '%s ' "${STORAGE_PIDS[@]}"
+echo
+cat <<EOF
+Logs: $GT_DIR/logs
+To stop everything: $PROJECT_ROOT/stop_service
+EOF
