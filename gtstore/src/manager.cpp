@@ -6,6 +6,7 @@
 #include <thread>
 #include <chrono>
 #include <cstdlib>
+#include <sstream>
 
 using namespace gtstore_utils;
 
@@ -13,7 +14,24 @@ namespace {
 const std::string COMPONENT_NAME = "manager";
 const int BACKLOG = 16;
 
+// This formats the routing table for logging.
+std::string describe_nodes(const std::vector<StorageNodeInfo> &nodes) {
+	if (nodes.empty()) {
+		return "<empty>";
+	}
+	std::ostringstream out;
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		out << nodes[i].node_id << "@" << nodes[i].address.host << ":" << nodes[i].address.port
+		    << " token=" << nodes[i].token;
+		if (i + 1 < nodes.size()) {
+			out << " | ";
+		}
+	}
+	return out.str();
+}
+
 bool send_table(int client_fd, const std::vector<StorageNodeInfo> &nodes, size_t replication_factor) {
+	log_line("INFO", "Sending routing table (rep=" + std::to_string(replication_factor) + "): " + describe_nodes(nodes));
 	std::string payload = build_table_payload(nodes, replication_factor);
 	return send_message(client_fd, MessageType::TABLE_PUSH, payload);
 }
@@ -112,6 +130,7 @@ void GTStoreManager::handle_storage_register(const std::string &payload) {
 		});
 	}
 	log_line("INFO", "Registered storage " + info.node_id + " at " + info.address.host + ":" + std::to_string(info.address.port));
+	log_line("INFO", "Routing table snapshot: " + describe_nodes(snapshot_nodes()));
 }
 
 // This records heartbeat timestamps.
@@ -132,7 +151,7 @@ void GTStoreManager::monitor_heartbeats() {
 	while (running) {
 		std::this_thread::sleep_for(std::chrono::seconds(2));
 		auto now = std::chrono::steady_clock::now();
-		std::vector<std::string> removed;
+		std::vector<std::pair<std::string, long long>> removed;
 		{
 			std::lock_guard<std::mutex> guard(table_mutex);
 			auto it = node_table.begin();
@@ -147,7 +166,11 @@ void GTStoreManager::monitor_heartbeats() {
 					expired = true;
 				}
 				if (expired) {
-					removed.push_back(it->node_id);
+					long long seconds_since = -1;
+					if (hb != heartbeat_times.end()) {
+						seconds_since = std::chrono::duration_cast<std::chrono::seconds>(now - hb->second).count();
+					}
+					removed.emplace_back(it->node_id, seconds_since);
 					heartbeat_times.erase(it->node_id);
 					it = node_table.erase(it);
 				} else {
@@ -155,8 +178,15 @@ void GTStoreManager::monitor_heartbeats() {
 				}
 			}
 		}
-		for (const auto &id : removed) {
-			log_line("WARN", "Removed dead storage " + id + " after missed heartbeats");
+		for (const auto &entry : removed) {
+			std::string msg = "Removed dead storage " + entry.first;
+			if (entry.second >= 0) {
+				msg += " after " + std::to_string(entry.second) + "s without heartbeat";
+			}
+			log_line("WARN", msg);
+		}
+		if (!removed.empty()) {
+			log_line("INFO", "Routing table snapshot: " + describe_nodes(snapshot_nodes()));
 		}
 	}
 }

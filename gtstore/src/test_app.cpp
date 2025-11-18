@@ -13,12 +13,12 @@ using namespace std;
 
 namespace {
 const vector<pair<string, string>> FAILURE_KEYS = {
-	{"fail_key1", "alpha"},
-	{"fail_key2", "bravo"},
-	{"fail_key3", "charlie"},
-	{"fail_key4", "delta"},
-	{"fail_key5", "echo"},
-	{"fail_key6", "foxtrot"}
+	{"key1", "value1"},
+	{"key2", "value2"},
+	{"key3", "value3"},
+	{"key4", "value4"},
+	{"key5", "value5"},
+	{"key6", "value6"}
 };
 
 // This appends a performance line when requested.

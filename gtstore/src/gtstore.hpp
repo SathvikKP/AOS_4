@@ -86,6 +86,7 @@ class GTStoreStorage {
 		bool key_valid(const std::string &key);
 		bool value_valid(const std::string &value);
 		void heartbeat_loop();
+		void log_current_store();
 	public:
 		void init();
 };

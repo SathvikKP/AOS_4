@@ -58,7 +58,7 @@ sleep 3
 echo "$MANAGER_PID" > "$STATE_FILE"
 STORAGE_PIDS=()
 for ((i=1; i<=NODES; ++i)); do
-    ./bin/storage > "logs/storage_${i}.log" 2>&1 &
+    GTSTORE_NODE_LABEL="node${i}" ./bin/storage > "logs/storage_${i}.log" 2>&1 &
     pid=$!
     STORAGE_PIDS+=("$pid")
     echo "$pid" >> "$STATE_FILE"

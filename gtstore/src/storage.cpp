@@ -1,6 +1,8 @@
 #include "gtstore.hpp"
 #include "utils.hpp"
 
+#include <cstdlib>
+#include <sstream>
 #include <thread>
 
 using namespace gtstore_utils;
@@ -82,7 +84,9 @@ void GTStoreStorage::handle_put(int client_fd, const std::string &payload) {
 		send_message(client_fd, MessageType::ERROR, "bad value");
 		return;
 	}
+	log_line("INFO", "PUT key=" + key + " value=" + value + " on " + storage_id);
 	kv_store[key] = value;
+	log_current_store();
 	send_message(client_fd, MessageType::PUT_OK, "ok");
 }
 
@@ -94,9 +98,11 @@ void GTStoreStorage::handle_get(int client_fd, const std::string &payload) {
 	}
 	auto it = kv_store.find(payload);
 	if (it == kv_store.end()) {
+		log_line("WARN", "GET miss key=" + payload + " on " + storage_id);
 		send_message(client_fd, MessageType::ERROR, "missing");
 		return;
 	}
+	log_line("INFO", "GET hit key=" + payload + " value=" + it->second + " on " + storage_id);
 	send_message(client_fd, MessageType::GET_OK, it->second);
 }
 
@@ -134,10 +140,16 @@ void GTStoreStorage::init() {
 	if (!kv_store.empty()) {
 		kv_store.clear();
 	}
-	storage_id = "node" + std::to_string(::getpid());
+	const char *label = std::getenv("GTSTORE_NODE_LABEL");
+	if (label && *label) {
+		storage_id = label;
+	} else {
+		storage_id = "node" + std::to_string(::getpid());
+	}
 	replication_factor = 1;
 	running = true;
 	setup_logging(COMPONENT_PREFIX + storage_id);
+	log_line("INFO", "Storage label set to " + storage_id);
 	NodeAddress addr{"127.0.0.1", listen_port};
 	listen_fd = create_listen_socket(addr, BACKLOG);
 	if (listen_fd < 0) {
@@ -149,6 +161,16 @@ void GTStoreStorage::init() {
 	heartbeat_thread = std::thread(&GTStoreStorage::heartbeat_loop, this);
 	heartbeat_thread.detach();
 	serve_clients();
+}
+
+// This prints every key/value in this storage.
+void GTStoreStorage::log_current_store() {
+	std::ostringstream out;
+	out << "Store snapshot on " << storage_id << ":";
+	for (const auto &entry : kv_store) {
+		out << " [" << entry.first << "=" << entry.second << "]";
+	}
+	log_line("INFO", out.str());
 }
 
 int main(int argc, char **argv) {

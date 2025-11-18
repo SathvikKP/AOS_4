@@ -3,8 +3,27 @@
 
 #include <algorithm>
 #include <functional>
+#include <sstream>
 
 using namespace gtstore_utils;
+
+namespace {
+// This prints a routing table snapshot for logging.
+std::string describe_table(const std::vector<StorageNodeInfo> &nodes) {
+	if (nodes.empty()) {
+		return "<empty>";
+	}
+	std::ostringstream out;
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		out << nodes[i].node_id << "@" << nodes[i].address.host << ":" << nodes[i].address.port
+		    << " token=" << nodes[i].token;
+		if (i + 1 < nodes.size()) {
+			out << " | ";
+		}
+	}
+	return out.str();
+}
+}
 
 // This prepares default manager address.
 GTStoreClient::GTStoreClient() {
@@ -87,6 +106,7 @@ bool GTStoreClient::refresh_table() {
 		return lhs.token < rhs.token;
 	});
 	log_line("INFO", "Routing table now has " + std::to_string(routing_table.size()) + " nodes with replication " + std::to_string(replication_factor));
+	log_line("INFO", "Routing table detail: " + describe_table(routing_table));
 	return !routing_table.empty();
 }
 
@@ -149,6 +169,7 @@ val_t GTStoreClient::get(string key) {
 				continue;
 			}
 			NodeAddress addr = node.address;
+			log_line("INFO", "get attempt key=" + key + " target=" + node.node_id);
 			int fd = connect_to_host(addr);
 			if (fd < 0) {
 				log_line("ERROR", "get connect failed for " + node.node_id);
@@ -167,6 +188,8 @@ val_t GTStoreClient::get(string key) {
 			close(fd);
 			if (ok && type == MessageType::GET_OK) {
 				value = parse_value(payload);
+				log_line("INFO", "get success key=" + key + " value=" + payload + " from=" + node.node_id);
+				std::cout << key << ", " << payload << ", " << node.node_id << std::endl;
 				return value;
 			}
 			refresh_table();
@@ -201,6 +224,7 @@ bool GTStoreClient::put(string key, val_t value) {
 			}
 		}
 		size_t stored = 0;
+		bool printed_primary = false;
 		for (size_t attempt = 0; attempt < replicas; ++attempt) {
 			StorageNodeInfo node = pick_node_for_attempt(key, attempt);
 			if (node.node_id.empty()) {
@@ -210,6 +234,9 @@ bool GTStoreClient::put(string key, val_t value) {
 				continue;
 			}
 			NodeAddress addr = node.address;
+			size_t sep_pos = payload.find('|');
+			std::string value_slice = (sep_pos == std::string::npos) ? payload : payload.substr(sep_pos + 1);
+			log_line("INFO", "put attempt key=" + key + " value=" + value_slice + " target=" + node.node_id);
 			int fd = connect_to_host(addr);
 			if (fd < 0) {
 				log_line("ERROR", "put connect failed for " + node.node_id);
@@ -223,6 +250,11 @@ bool GTStoreClient::put(string key, val_t value) {
 			close(fd);
 			if (ack) {
 				++stored;
+				log_line("INFO", "put success key=" + key + " stored_on=" + node.node_id);
+				if (!printed_primary) {
+					std::cout << "OK, " << node.node_id << std::endl;
+					printed_primary = true;
+				}
 				if (stored == replicas) {
 					log_line("INFO", "put stored on " + std::to_string(stored) + " replicas");
 					return true;
@@ -240,6 +272,8 @@ void GTStoreClient::finalize() {
 
 		cout << "Inside GTStoreClient::finalize() for client " << client_id << "\n";
 		log_line("INFO", "client finalize called");
+
+		//note: no cleanup is done in this implementation....
 }
 
 // This returns the current routing table snapshot.
