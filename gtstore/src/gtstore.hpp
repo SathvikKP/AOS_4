@@ -66,6 +66,13 @@ class GTStoreManager {
 		void handle_heartbeat(const string &payload);
 		vector<StorageNodeInfo> snapshot_nodes();
 		void monitor_heartbeats();
+		void rebalance_on_node_failure(int failed_idx, uint64_t failed_token, const vector<StorageNodeInfo> &nodes);
+		void rebalance_on_node_join(int new_idx, uint64_t new_token);
+		int find_node_index(const string &node_id) const;
+		vector<string> get_all_keys_from_node(const NodeAddress &addr);
+		void replicate_key_to_node(const string &key, const string &value, const NodeAddress &dest_addr);
+		std::pair<bool, std::string> get_key_from_node(const std::string &key, const NodeAddress &addr);
+		void delete_key_from_node(const std::string &key, const NodeAddress &addr);
 	public:
 		void init();
 };
@@ -79,14 +86,19 @@ class GTStoreStorage {
 		size_t replication_factor;
 		std::thread heartbeat_thread;
 		bool running;
+		std::mutex lock_manager_mutex;
+		unordered_map<string, string> key_locks;  // maps key -> client_id holding lock
 		void register_with_manager();
 		void serve_clients();
-		void handle_put(int client_fd, const string &payload);
+		void handle_put(int client_fd, const string &payload, bool is_primary);
 		void handle_get(int client_fd, const string &payload);
+		void handle_delete(int client_fd, const string &payload);
 		bool key_valid(const std::string &key);
 		bool value_valid(const std::string &value);
 		void heartbeat_loop();
 		void log_current_store();
+		bool try_acquire_lock(const string &key, const string &client_id);
+		void release_lock(const string &key);
 	public:
 		void init();
 };

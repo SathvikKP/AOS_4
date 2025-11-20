@@ -22,7 +22,12 @@ enum class MessageType : uint16_t {
     HEARTBEAT_ACK = 9,
     TABLE_PUSH = 10,
     STORAGE_REGISTER = 11,
-    CLIENT_HELLO = 12
+    CLIENT_HELLO = 12,
+    REPL_CONFIRM = 13,
+    GET_ALL_KEYS = 14,
+    ALL_KEYS = 15,
+    CLIENT_DELETE = 16,
+    DELETE_OK = 17
 };
 
 // NEWLY ADDED: compact header carried before each payload

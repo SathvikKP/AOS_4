@@ -14,13 +14,13 @@ const int BACKLOG = 16;
 
 // This tells manager about this storage node.
 void GTStoreStorage::register_with_manager() {
-	NodeAddress manager_addr{DEFAULT_MANAGER_HOST, DEFAULT_MANAGER_PORT};
+	NodeAddress manager_addr{DEFAULT_MANAGER_HOST, DEFAULT_MANAGER_PORT}; // maybe argument?
 	int fd = connect_to_host(manager_addr);
 	if (fd < 0) {
 		log_line("ERROR", "could not reach manager");
 		return;
 	}
-	std::string payload = storage_id + ",127.0.0.1," + std::to_string(listen_port);
+	std::string payload = storage_id + ",127.0.0.1," + std::to_string(listen_port); // remember to mention fixed address to report
 	if (!send_message(fd, MessageType::STORAGE_REGISTER, payload)) {
 		log_line("ERROR", "failed to send register");
 		close(fd);
@@ -33,6 +33,7 @@ void GTStoreStorage::register_with_manager() {
 		auto nodes = parse_table_payload(table_payload, parsed_factor);
 		replication_factor = parsed_factor;
 		log_line("INFO", "Received table with " + std::to_string(nodes.size()) + " nodes at replication " + std::to_string(replication_factor));
+		// do not keep the table?
 	}
 	close(fd);
 }
@@ -52,7 +53,7 @@ void GTStoreStorage::heartbeat_loop() {
 		}
 		MessageType type;
 		std::string payload;
-		recv_message(fd, type, payload);
+		recv_message(fd, type, payload); // if not ack, blocked?
 		close(fd);
 	}
 }
@@ -68,7 +69,7 @@ bool GTStoreStorage::value_valid(const std::string &value) {
 }
 
 // This stores a key locally.
-void GTStoreStorage::handle_put(int client_fd, const std::string &payload) {
+void GTStoreStorage::handle_put(int client_fd, const std::string &payload, bool is_primary) {
 	auto pos = payload.find('|');
 	if (pos == std::string::npos) {
 		send_message(client_fd, MessageType::ERROR, "bad put");
@@ -84,10 +85,39 @@ void GTStoreStorage::handle_put(int client_fd, const std::string &payload) {
 		send_message(client_fd, MessageType::ERROR, "bad value");
 		return;
 	}
+	
+	// Only primary needs to acquire lock
+	std::string client_id = "client_" + std::to_string(client_fd);
+	if (is_primary) {
+		if (!try_acquire_lock(key, client_id)) {
+			send_message(client_fd, MessageType::ERROR, "locked");
+			log_line("WARN", "PUT rejected key=" + key + " (locked) on " + storage_id);
+			return;
+		}
+	}
+	
 	log_line("INFO", "PUT key=" + key + " value=" + value + " on " + storage_id);
 	kv_store[key] = value;
 	log_current_store();
+	
+	// Send PUT_OK
 	send_message(client_fd, MessageType::PUT_OK, "ok");
+	
+	// Only primary waits for REPL_CONFIRM
+	if (is_primary) {
+		MessageType confirm_type;
+		std::string confirm_payload;
+		if (recv_message(client_fd, confirm_type, confirm_payload) && 
+		    confirm_type == MessageType::REPL_CONFIRM) {
+			log_line("INFO", "Replication confirmed for key=" + key);
+			release_lock(key);
+			send_message(client_fd, MessageType::PUT_OK, "replicated");
+		} else {
+			log_line("WARN", "No replication confirmation for key=" + key);
+			release_lock(key);
+			send_message(client_fd, MessageType::ERROR, "no_confirmation");
+		}
+	}
 }
 
 // This reads a key locally.
@@ -99,11 +129,29 @@ void GTStoreStorage::handle_get(int client_fd, const std::string &payload) {
 	auto it = kv_store.find(payload);
 	if (it == kv_store.end()) {
 		log_line("WARN", "GET miss key=" + payload + " on " + storage_id);
-		send_message(client_fd, MessageType::ERROR, "missing");
+		send_message(client_fd, MessageType::ERROR, "missing"); // this should happen only if key is not in gt store in general
 		return;
 	}
 	log_line("INFO", "GET hit key=" + payload + " value=" + it->second + " on " + storage_id);
 	send_message(client_fd, MessageType::GET_OK, it->second);
+}
+
+// This deletes a key locally.
+void GTStoreStorage::handle_delete(int client_fd, const std::string &payload) {
+	if (!key_valid(payload)) {
+		send_message(client_fd, MessageType::ERROR, "bad key");
+		return;
+	}
+	auto it = kv_store.find(payload);
+	if (it == kv_store.end()) {
+		log_line("WARN", "DELETE miss key=" + payload + " on " + storage_id);
+		send_message(client_fd, MessageType::DELETE_OK, "not_found");
+		return;
+	}
+	log_line("INFO", "DELETE key=" + payload + " on " + storage_id);
+	kv_store.erase(it);
+	log_current_store();
+	send_message(client_fd, MessageType::DELETE_OK, "ok");
 }
 
 // This accepts client requests.
@@ -121,9 +169,24 @@ void GTStoreStorage::serve_clients() {
 				return;
 			}
 			if (type == MessageType::CLIENT_PUT) {
-				handle_put(client_fd, payload);
+				handle_put(client_fd, payload, true);  // true = is_primary
+			} else if (type == MessageType::REPL_PUT) {
+				handle_put(client_fd, payload, false); // false = is_replica
 			} else if (type == MessageType::CLIENT_GET) {
 				handle_get(client_fd, payload);
+			} else if (type == MessageType::CLIENT_DELETE) {
+				handle_delete(client_fd, payload);
+			} else if (type == MessageType::GET_ALL_KEYS) {
+				// Manager requesting all keys for rebalancing
+				std::string keys_payload;
+				for (const auto &entry : kv_store) {
+					if (!keys_payload.empty()) {
+						keys_payload += ",";
+					}
+					keys_payload += entry.first;
+				}
+				log_line("INFO", "GET_ALL_KEYS request: returning " + std::to_string(kv_store.size()) + " keys");
+				send_message(client_fd, MessageType::ALL_KEYS, keys_payload);
 			} else {
 				send_message(client_fd, MessageType::ERROR, "unknown");
 			}
@@ -157,7 +220,7 @@ void GTStoreStorage::init() {
 		return;
 	}
 	log_line("INFO", "Listening on " + addr.host + ":" + std::to_string(addr.port));
-	register_with_manager();
+	register_with_manager(); // shouldnt we exit if it fails?
 	heartbeat_thread = std::thread(&GTStoreStorage::heartbeat_loop, this);
 	heartbeat_thread.detach();
 	serve_clients();
@@ -171,6 +234,29 @@ void GTStoreStorage::log_current_store() {
 		out << " [" << entry.first << "=" << entry.second << "]";
 	}
 	log_line("INFO", out.str());
+}
+
+// This tries to acquire a write lock on a key.
+bool GTStoreStorage::try_acquire_lock(const string &key, const string &client_id) {
+	std::lock_guard<std::mutex> guard(lock_manager_mutex);
+	auto it = key_locks.find(key);
+	if (it != key_locks.end()) {
+		// Key is already locked by another client
+		return false;
+	}
+	key_locks[key] = client_id;
+	log_line("INFO", "Lock acquired for key=" + key + " by client=" + client_id);
+	return true;
+}
+
+// This releases a write lock on a key.
+void GTStoreStorage::release_lock(const string &key) {
+	std::lock_guard<std::mutex> guard(lock_manager_mutex);
+	auto it = key_locks.find(key);
+	if (it != key_locks.end()) {
+		log_line("INFO", "Lock released for key=" + key + " by client=" + it->second);
+		key_locks.erase(it);
+	}
 }
 
 int main(int argc, char **argv) {

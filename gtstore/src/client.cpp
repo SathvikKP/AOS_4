@@ -42,7 +42,7 @@ StorageNodeInfo GTStoreClient::pick_node_for_attempt(const string &key, size_t a
 	if (routing_table.empty()) {
 		return StorageNodeInfo{"", {DEFAULT_MANAGER_HOST, DEFAULT_STORAGE_BASE_PORT}, 0};
 	}
-	std::hash<std::string> hasher;
+	std::hash<std::string> hasher; // is this uin64_t?
 	uint64_t hash_value = hasher(key);
 	size_t start_index = routing_table.size();
 	for (size_t i = 0; i < routing_table.size(); ++i) {
@@ -72,7 +72,7 @@ val_t GTStoreClient::parse_value(const string &payload) {
 
 // This turns value list into string.
 string GTStoreClient::serialize_value(const val_t &value) {
-	return join(value, ',');
+	return join(value, ','); // why not in utils like others?
 }
 
 // This refreshes the routing table from manager.
@@ -152,7 +152,6 @@ void GTStoreClient::init(int id) {
 
 // This asks storage node for a key.
 val_t GTStoreClient::get(string key) {
-
 		cout << "Inside GTStoreClient::get() for client: " << client_id << " key: " << key << "\n";
 		val_t value;
 		if (!validate_key(key)) {
@@ -162,7 +161,7 @@ val_t GTStoreClient::get(string key) {
 		size_t max_attempts = std::min(replication_factor, std::max<size_t>(1, available_nodes));
 		for (size_t attempt = 0; attempt < max_attempts; ++attempt) {
 			StorageNodeInfo node = pick_node_for_attempt(key, attempt);
-			if (node.node_id.empty()) {
+			if (node.node_id.empty()) { // revisit
 				if (!refresh_table()) {
 					break;
 				}
@@ -223,8 +222,13 @@ bool GTStoreClient::put(string key, val_t value) {
 				return false;
 			}
 		}
+		
 		size_t stored = 0;
+		StorageNodeInfo primary_node;
+		int primary_fd = -1;
 		bool printed_primary = false;
+		
+		// Send CLIENT_PUT to primary, REPL_PUT to replicas
 		for (size_t attempt = 0; attempt < replicas; ++attempt) {
 			StorageNodeInfo node = pick_node_for_attempt(key, attempt);
 			if (node.node_id.empty()) {
@@ -233,9 +237,13 @@ bool GTStoreClient::put(string key, val_t value) {
 				}
 				continue;
 			}
+			
 			NodeAddress addr = node.address;
 			size_t sep_pos = payload.find('|');
 			std::string value_slice = (sep_pos == std::string::npos) ? payload : payload.substr(sep_pos + 1);
+			
+			// Use CLIENT_PUT for primary (attempt 0), REPL_PUT for replicas
+			MessageType put_type = (attempt == 0) ? MessageType::CLIENT_PUT : MessageType::REPL_PUT;
 			log_line("INFO", "put attempt key=" + key + " value=" + value_slice + " target=" + node.node_id);
 			int fd = connect_to_host(addr);
 			if (fd < 0) {
@@ -243,11 +251,20 @@ bool GTStoreClient::put(string key, val_t value) {
 				refresh_table();
 				continue;
 			}
-			bool ok = send_message(fd, MessageType::CLIENT_PUT, payload);
+			bool ok = send_message(fd, put_type, payload);
 			MessageType type;
 			std::string resp;
 			bool ack = ok && recv_message(fd, type, resp) && type == MessageType::PUT_OK;
-			close(fd);
+			
+			if (attempt == 0) {
+				// For primary, keep the connection open for REPL_CONFIRM
+				primary_node = node;
+				primary_fd = fd;
+			} else {
+				// For replicas, close the connection after PUT_OK
+				close(fd);
+			}
+			
 			if (ack) {
 				++stored;
 				log_line("INFO", "put success key=" + key + " stored_on=" + node.node_id);
@@ -255,16 +272,40 @@ bool GTStoreClient::put(string key, val_t value) {
 					std::cout << "OK, " << node.node_id << std::endl;
 					printed_primary = true;
 				}
-				if (stored == replicas) {
-					log_line("INFO", "put stored on " + std::to_string(stored) + " replicas");
-					return true;
+			} else {
+				if (attempt == 0) {
+					close(primary_fd);
+					primary_fd = -1;
 				}
-				continue;
+				refresh_table();
 			}
-			refresh_table();
 		}
-		log_line("WARN", "put stored on " + std::to_string(stored) + " of " + std::to_string(replicas) + " replicas");
-		return false;
+		
+		// Check if we stored on all replicas
+		if (stored != replicas) {
+			log_line("WARN", "put stored on " + std::to_string(stored) + " of " + std::to_string(replicas) + " replicas");
+			if (primary_fd >= 0) {
+				close(primary_fd);
+			}
+			return false;
+		}
+		
+		// Send REPL_CONFIRM to primary on the same connection to release lock
+		if (primary_fd >= 0 && !primary_node.node_id.empty()) {
+			bool ok = send_message(primary_fd, MessageType::REPL_CONFIRM, key);
+			MessageType type;
+			std::string resp;
+			bool ack = ok && recv_message(primary_fd, type, resp) && type == MessageType::PUT_OK;
+			close(primary_fd);
+			if (!ack) {
+				log_line("WARN", "put repl_confirm failed for " + primary_node.node_id);
+				return false;
+			}
+			log_line("INFO", "put replication confirmed for key=" + key);
+		}
+		
+		log_line("INFO", "put stored on " + std::to_string(stored) + " replicas");
+		return true;
 }
 
 // This closes client side work.
