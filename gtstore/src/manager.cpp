@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <sstream>
+#include <unordered_set>
 
 using namespace gtstore_utils;
 
@@ -296,7 +297,8 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 	// Since the failed node is already removed, the successor is now at failed_idx (wrapping if needed)
 	int predecessor_idx = (failed_idx - 1 + (int)nodes.size()) % (int)nodes.size();
 	int successor_idx = failed_idx % (int)nodes.size(); // Node that was after failed is now at failed_idx
-	
+	int earliest_predecessor_idx = (failed_idx - (int)(replication_factor - 1) + (int)nodes.size()) % (int)nodes.size();
+
 	log_line("INFO", "Querying immediate predecessor idx=" + std::to_string(predecessor_idx) + " and successor idx=" + std::to_string(successor_idx));
 	
 	// Query keys from both immediate neighbors
@@ -304,12 +306,13 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 	std::vector<std::string> succ_keys = get_all_keys_from_node(nodes[successor_idx].address);
 	log_line("INFO", "Predecessor has " + std::to_string(pred_keys.size()) + " keys, Successor has " + std::to_string(succ_keys.size()) + " keys");
 	
-	// Merge both key lists
-	pred_keys.insert(pred_keys.end(), succ_keys.begin(), succ_keys.end());
+	// Merge both key lists into a set to avoid duplicates
+	std::unordered_set<std::string> all_keys(pred_keys.begin(), pred_keys.end());
+	all_keys.insert(succ_keys.begin(), succ_keys.end());
 	
 	// For each key from both neighbors: rebalance if it's in the range that lost a replica
 	std::hash<std::string> hasher;
-	for (const auto &key : pred_keys) {
+	for (const auto &key : all_keys) {
 		uint64_t key_hash = hasher(key);
 		
 		// Find primary node for this key (first node with token >= key_hash)
@@ -324,13 +327,15 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 			primary_idx = 0; // Wrap around
 		}
 		
-		// primary node of key should be within [predecessor_idx, successor_idx)
+		// primary node of key should be within [predecessor_idx, successor_idx]
 		bool in_range = false;
-		if (predecessor_idx <= successor_idx) {
-			in_range = (primary_idx >= predecessor_idx && primary_idx < successor_idx);
+		if (primary_idx == successor_idx) {
+			in_range = (key_hash <= failed_token); // ignore next node's primary keys
+		} else if (earliest_predecessor_idx <= successor_idx) {
+			in_range = (primary_idx >= earliest_predecessor_idx && primary_idx < successor_idx);
 		} else {
 			// wrap around case
-			in_range = (primary_idx >= predecessor_idx || primary_idx < successor_idx);
+			in_range = (primary_idx >= earliest_predecessor_idx || primary_idx < successor_idx);
 		}
 		
 		if (!in_range) {
@@ -375,11 +380,6 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 	for (const auto &key : next_node_keys) {
 		uint64_t key_hash = hasher(key);
 		
-		// Only steal keys that belong to the new node's range (hash <= new_token)
-		if (key_hash > new_token) {
-			continue;
-		}
-		
 		// Find the primary node for this key
 		int primary_idx = -1;
 		for (size_t j = 0; j < nodes.size(); ++j) {
@@ -390,6 +390,21 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 		}
 		if (primary_idx < 0) {
 			primary_idx = 0; // Wrap around
+		}
+		
+		// Only steal keys if the new node is a replica for this key
+		// Check if new_idx is in the replica range [primary_idx, primary_idx+K-1]
+		bool is_replica = false;
+		int last_replica_idx = (primary_idx + (int)(replication_factor - 1)) % (int)nodes.size();
+		if (primary_idx <= last_replica_idx) {
+			is_replica = (new_idx >= primary_idx && new_idx <= last_replica_idx);
+		} else {
+			// wrap around case
+			is_replica = (new_idx >= primary_idx || new_idx <= last_replica_idx);
+		}
+		
+		if (!is_replica) {
+			continue;
 		}
 		
 		// Get the key-value pair from the primary node
