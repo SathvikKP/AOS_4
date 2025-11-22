@@ -312,12 +312,6 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 	for (const auto &key : pred_keys) {
 		uint64_t key_hash = hasher(key);
 		
-		// Only rebalance keys whose hash is less than the failed node's position
-		// (i.e., keys that would have had the failed node as a replica)
-		if (key_hash > failed_token) {
-			continue; // This key wasn't affected by this node's failure
-		}
-		
 		// Find primary node for this key (first node with token >= key_hash)
 		int primary_idx = -1;
 		for (size_t j = 0; j < nodes.size(); ++j) {
@@ -330,11 +324,32 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 			primary_idx = 0; // Wrap around
 		}
 		
+		// primary node of key should be within [predecessor_idx, successor_idx)
+		bool in_range = false;
+		if (predecessor_idx <= successor_idx) {
+			in_range = (primary_idx >= predecessor_idx && primary_idx < successor_idx);
+		} else {
+			// wrap around case
+			in_range = (primary_idx >= predecessor_idx || primary_idx < successor_idx);
+		}
+		
+		if (!in_range) {
+			continue;
+		}
+		
 		// The K-th replica position for this key (which was on the failed node)
 		int kth_replica_idx = (primary_idx + (int)(replication_factor - 1)) % (int)nodes.size();
 		
+		// get the key-value pair from the primary node
+		std::pair<bool, std::string> result = get_key_from_node(key, nodes[primary_idx].address);
+		if (!result.first) {
+			log_line("WARN", "Failed to get key '" + key + "' from primary node idx=" + std::to_string(primary_idx));
+			continue;
+		}
+		std::string value = result.second;
+
 		log_line("INFO", "Rebalancing key '" + key + "' to node idx " + std::to_string(kth_replica_idx));
-		replicate_key_to_node(key, "rebalanced_value", nodes[kth_replica_idx].address);
+		replicate_key_to_node(key, value, nodes[kth_replica_idx].address);
 	}
 	
 	log_line("INFO", "Rebalancing complete for failed node at idx=" + std::to_string(failed_idx));
