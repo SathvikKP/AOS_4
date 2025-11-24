@@ -32,6 +32,7 @@ bool GTStoreStorage::register_with_manager() {
 		size_t parsed_factor = 1;
 		auto nodes = parse_table_payload(table_payload, parsed_factor);
 		replication_factor = parsed_factor;
+		routing_table = nodes;
 		log_line("INFO", "Received table with " + to_string(nodes.size()) + " nodes at replication " + to_string(replication_factor));
 		close(fd);
 		return true;
@@ -118,27 +119,83 @@ void GTStoreStorage::handle_put(int client_fd, const string &payload, bool is_pr
 	}
 	log_current_store();
 	
-	// Send PUT_OK
-	send_message(client_fd, MessageType::PUT_OK, "ok");
-	
-	// Only primary waits for REPL_CONFIRM
+	// If primary, forward to all other K-1 replicas for this key (excluding self)
 	if (is_primary) {
-		MessageType confirm_type;
-		string confirm_payload;
-		if (recv_message(client_fd, confirm_type, confirm_payload) && 
-		    confirm_type == MessageType::REPL_CONFIRM) {
-			log_line("INFO", "Replication confirmed for " + to_string(kv_pairs.size()) + " key(s)");
-			for (const auto &key : acquired_locks) {
-				release_lock(key);
+		int cur_idx = -1;
+		for (size_t i = 0; i < routing_table.size(); ++i) {
+			if (routing_table[i].node_id == storage_id) {
+				cur_idx = static_cast<int>(i);
+				break;
 			}
-			send_message(client_fd, MessageType::PUT_OK, "replicated");
-		} else {
-			log_line("WARN", "No replication confirmation for " + to_string(kv_pairs.size()) + " key(s)");
-			for (const auto &key : acquired_locks) {
-				release_lock(key);
-			}
-			send_message(client_fd, MessageType::ERROR, "no_confirmation");
 		}
+
+		if (cur_idx == -1) {
+			log_line("ERROR", "Cannot find self storage in routing table");
+			send_message(client_fd, MessageType::ERROR, "routing error");
+			for (const auto &key : acquired_locks) {
+				release_lock(key);
+			}
+			return;
+		}
+		
+		// get primary index for first key to determine the k replicas
+		string first_key = kv_pairs[0].first;
+		uint64_t key_hash = hash<string>{}(first_key);
+		
+		int primary_idx = 0;
+		for (size_t i = 0; i < routing_table.size(); ++i) {
+			if (key_hash <= routing_table[i].token) {
+				primary_idx = static_cast<int>(i);
+				break;
+			}
+		}
+		
+		size_t successful_replicas = 1;
+		for (size_t rep = 0; rep < replication_factor; ++rep) {
+			int replica_idx = (primary_idx + static_cast<int>(rep)) % static_cast<int>(routing_table.size());
+			if (replica_idx == cur_idx) {
+				continue; // skip self
+			}
+			
+			const auto &replica_info = routing_table[replica_idx];
+			
+			int replica_fd = connect_to_host(replica_info.address);
+			if (replica_fd < 0) {
+				log_line("WARN", "Failed to connect to replica " + replica_info.node_id);
+				continue; // try next
+			}
+			
+			if (!send_message(replica_fd, MessageType::REPL_PUT, payload)) {
+				log_line("WARN", "Failed to send REPL_PUT to " + replica_info.node_id);
+				close(replica_fd);
+				continue; // try next
+			}
+			
+			MessageType resp_type;
+			string resp_payload;
+			if (!recv_message(replica_fd, resp_type, resp_payload) || resp_type != MessageType::PUT_OK) {
+				log_line("WARN", "Replica " + replica_info.node_id + " did not confirm PUT");
+				close(replica_fd);
+				continue; // try next replica
+			}
+			
+			close(replica_fd);
+			log_line("INFO", "Replica " + replica_info.node_id + " confirmed PUT");
+			++successful_replicas;
+		}
+		
+		// release locks
+		for (const auto &key : acquired_locks) {
+			release_lock(key);
+		}
+		
+		// succeed as long as we stored on at least one node (self)
+		send_message(client_fd, MessageType::PUT_OK, "replicated");
+		log_line("INFO", "Chain replication completed: " + to_string(successful_replicas) + "/" + 
+		         to_string(replication_factor) + " replicas for " + to_string(kv_pairs.size()) + " key(s)");
+	} else {
+		// non-primary replica just sends PUT_OK
+		send_message(client_fd, MessageType::PUT_OK, "ok");
 	}
 }
 
@@ -220,27 +277,111 @@ void GTStoreStorage::serve_clients() {
 				close(client_fd);
 				return;
 			}
-			if (type == MessageType::CLIENT_PUT) {
-				handle_put(client_fd, payload, true);  // true = is_primary
-			} else if (type == MessageType::REPL_PUT) {
-				handle_put(client_fd, payload, false); // false = is_replica
-			} else if (type == MessageType::CLIENT_GET) {
-				handle_get(client_fd, payload);
-			} else if (type == MessageType::CLIENT_DELETE) {
-				handle_delete(client_fd, payload);
-			} else if (type == MessageType::GET_ALL_KEYS) {
-				// Manager requesting all keys for rebalancing
-				string keys_payload;
-				for (const auto &entry : kv_store) {
-					if (!keys_payload.empty()) {
-						keys_payload += ",";
+			
+			bool is_paused = false;
+			{
+				lock_guard<mutex> guard(pause_mutex);
+				is_paused = paused;
+			}
+			
+			switch (type) {
+				case MessageType::PAUSE_NODE:
+					{
+						lock_guard<mutex> guard(pause_mutex);
+						paused = true;
 					}
-					keys_payload += entry.first;
-				}
-				log_line("INFO", "GET_ALL_KEYS request: returning " + to_string(kv_store.size()) + " keys");
-				send_message(client_fd, MessageType::ALL_KEYS, keys_payload);
-			} else {
-				send_message(client_fd, MessageType::ERROR, "unknown");
+					log_line("INFO", "Node paused for rebalancing");
+					send_message(client_fd, MessageType::PAUSE_ACK, "paused");
+					close(client_fd);
+					return;
+					
+				case MessageType::RESUME_NODE:
+					{
+						lock_guard<mutex> guard(pause_mutex);
+						paused = false;
+					}
+					log_line("INFO", "Node resumed from rebalancing");
+					send_message(client_fd, MessageType::RESUME_ACK, "resumed");
+					close(client_fd);
+					return;
+					
+				case MessageType::AVAILABILITY_CHECK:
+					{
+						bool is_available = false;
+						{
+							lock_guard<mutex> guard(lock_manager_mutex);
+							is_available = key_locks.empty();
+						}
+						string status = is_available ? "yes" : "no";
+						log_line("INFO", "Availability check: " + status + " (" + to_string(key_locks.size()) + " locks)");
+						send_message(client_fd, MessageType::AVAILABLE_STATUS, status);
+					}
+					close(client_fd);
+					return;
+					
+				case MessageType::CLIENT_PUT:
+					if (is_paused) {
+						log_line("WARN", "Rejecting CLIENT_PUT - node is paused for rebalancing");
+						send_message(client_fd, MessageType::ERROR, "node_paused");
+						close(client_fd);
+						return;
+					}
+					handle_put(client_fd, payload, true);  // true = is_primary
+					break;
+					
+				case MessageType::REPL_PUT:
+					handle_put(client_fd, payload, false); // false = is_replica
+					break;
+					
+				case MessageType::CLIENT_GET:
+					if (is_paused) {
+						log_line("WARN", "Rejecting CLIENT_GET - node is paused for rebalancing");
+						send_message(client_fd, MessageType::ERROR, "node_paused");
+						close(client_fd);
+						return;
+					}
+					handle_get(client_fd, payload);
+					break;
+					
+				case MessageType::MANAGER_GET:
+					handle_get(client_fd, payload);
+					break;
+					
+				case MessageType::MANAGER_DELETE:
+					handle_delete(client_fd, payload);
+					break;
+					
+				case MessageType::GET_ALL_KEYS:
+					{
+						// Manager requesting all keys for rebalancing
+						string keys_payload;
+						for (const auto &entry : kv_store) {
+							if (!keys_payload.empty()) {
+								keys_payload += ",";
+							}
+							keys_payload += entry.first;
+						}
+						log_line("INFO", "GET_ALL_KEYS request: returning " + to_string(kv_store.size()) + " keys");
+						send_message(client_fd, MessageType::ALL_KEYS, keys_payload);
+					}
+					break;
+					
+				case MessageType::TABLE_PUSH:
+					{
+						// manager pushing updated routing table
+						size_t parsed_factor = 0;
+						auto nodes = parse_table_payload(payload, parsed_factor);
+						routing_table = nodes;
+						replication_factor = parsed_factor;
+						log_line("INFO", "Received routing table with " + to_string(nodes.size()) + 
+						         " nodes at replication " + to_string(parsed_factor));
+						send_message(client_fd, MessageType::HEARTBEAT_ACK, "table_updated");
+					}
+					break;
+					
+				default:
+					send_message(client_fd, MessageType::ERROR, "unknown");
+					break;
 			}
 			close(client_fd);
 		}).detach();
@@ -294,6 +435,7 @@ void GTStoreStorage::init() {
 	}
 	replication_factor = 1;
 	running = true;
+	paused = false;
 	setup_logging(COMPONENT_PREFIX + storage_id);
 	log_line("INFO", "Storage label set to " + storage_id);
 	

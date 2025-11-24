@@ -26,8 +26,15 @@ enum class MessageType : uint16_t {
     REPL_CONFIRM = 13,
     GET_ALL_KEYS = 14,
     ALL_KEYS = 15,
-    CLIENT_DELETE = 16,
-    DELETE_OK = 17
+    DELETE_OK = 17,
+    PAUSE_NODE = 18,
+    RESUME_NODE = 19,
+    PAUSE_ACK = 20,
+    RESUME_ACK = 21,
+    AVAILABILITY_CHECK = 22,
+    AVAILABLE_STATUS = 23,
+    MANAGER_GET = 24,
+    MANAGER_DELETE = 25
 };
 
 // compact header carried before each payload

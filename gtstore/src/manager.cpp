@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <sstream>
 #include <unordered_set>
+#include <map>
+#include <set>
 
 using namespace gtstore_utils;
 using namespace std;
@@ -79,10 +81,15 @@ void GTStoreManager::accept_loop() {
 				return;
 			}
 				switch (type) {
-					case MessageType::STORAGE_REGISTER:
-						handle_storage_register(payload);
+					case MessageType::STORAGE_REGISTER: {
+						StorageNodeInfo registered_node = handle_storage_register(payload);
 						send_table(client_fd, snapshot_nodes(), replication_factor);
+						close(client_fd);
+
+						rebalance_on_node_join(registered_node.token);
+						broadcast_table_to_storage_nodes();
 						break;
+					}
 					case MessageType::CLIENT_HELLO:
 						log_line("INFO", "Client requested table");
 						send_table(client_fd, snapshot_nodes(), replication_factor);
@@ -100,11 +107,11 @@ void GTStoreManager::accept_loop() {
 }
 
 // This records a storage registration.
-void GTStoreManager::handle_storage_register(const string &payload) {
+StorageNodeInfo GTStoreManager::handle_storage_register(const string &payload) {
 	auto parts = gtstore_utils::split(payload, ',');
 	if (parts.size() != 3) {
 		log_line("WARN", "Invalid storage registration payload");
-		return;
+		return {};
 	}
 	StorageNodeInfo info;
 	info.node_id = parts[0];
@@ -112,7 +119,6 @@ void GTStoreManager::handle_storage_register(const string &payload) {
 	info.address.port = static_cast<uint16_t>(stoi(parts[2]));
 	hash<string> hasher;
 	string token_seed = info.node_id + "-" + info.address.host + ":" + to_string(info.address.port);
-	size_t idx = -1;
 	info.token = static_cast<uint64_t>(hasher(token_seed));
 	{
 		lock_guard<mutex> guard(node_table_mutex);
@@ -121,10 +127,8 @@ void GTStoreManager::handle_storage_register(const string &payload) {
 		});
 		if (existing != node_table.end()) {
 			*existing = info;
-			idx = distance(node_table.begin(), existing);
 		} else {
 			node_table.push_back(info);
-			idx = node_table.size() - 1;
 		}
 
 		{
@@ -138,12 +142,7 @@ void GTStoreManager::handle_storage_register(const string &payload) {
 	}
 	log_line("INFO", "Registered storage " + info.node_id + " at " + info.address.host + ":" + to_string(info.address.port));
 	log_line("INFO", "Routing table snapshot: " + describe_table(snapshot_nodes()));
-	
-	// Trigger rebalancing for the new node
-	if (idx >= 0 && node_table.size() > 1) {
-		// Only rebalance if there are other nodes
-		rebalance_on_node_join(idx, info.token); // TODO: block operations while rebalancing?
-	}
+	return info;
 }
 
 // This records heartbeat timestamps.
@@ -156,6 +155,39 @@ void GTStoreManager::handle_heartbeat(const string &payload) {
 vector<StorageNodeInfo> GTStoreManager::snapshot_nodes() {
 	lock_guard<mutex> guard(node_table_mutex);
 	return node_table;
+}
+
+// This broadcasts the current routing table to all storage nodes.
+void GTStoreManager::broadcast_table_to_storage_nodes() {
+	auto nodes = snapshot_nodes();
+	string payload = build_table_payload(nodes, replication_factor);
+	
+	log_line("INFO", "Broadcasting routing table to " + to_string(nodes.size()) + " storage nodes");
+	
+	for (const auto &node : nodes) {
+		int fd = connect_to_host(node.address);
+		if (fd < 0) {
+			log_line("WARN", "Failed to connect to " + node.node_id + " for table broadcast");
+			continue;
+		}
+		
+		if (!send_message(fd, MessageType::TABLE_PUSH, payload)) {
+			log_line("WARN", "Failed to send table to " + node.node_id);
+			close(fd);
+			continue;
+		}
+		
+		MessageType resp_type;
+		string resp_payload;
+		if (!recv_message(fd, resp_type, resp_payload)) {
+			log_line("WARN", "No ack from " + node.node_id + " after table broadcast");
+			close(fd);
+			continue;
+		}
+		
+		close(fd);
+		log_line("INFO", "Table broadcast sent to " + node.node_id);
+	}
 }
 
 // This retrieves all keys from a storage node.
@@ -227,8 +259,8 @@ vector<string> GTStoreManager::get_key_from_node(const vector<string> &keys, con
 	
 	string keys_payload = join(keys, ';');
 	
-	if (!send_message(fd, MessageType::CLIENT_GET, keys_payload)) {
-		log_line("WARN", "Failed to send CLIENT_GET");
+	if (!send_message(fd, MessageType::MANAGER_GET, keys_payload)) {
+		log_line("WARN", "Failed to send MANAGER_GET");
 		close(fd);
 		return values;
 	}
@@ -255,10 +287,10 @@ void GTStoreManager::delete_key_from_node(const vector<string> &keys, const Node
 		return;
 	}
 
-	string keys_payload = join(keys, ";");
+	string keys_payload = join(keys, ';');
 
-	if (!send_message(fd, MessageType::CLIENT_DELETE, keys_payload)) {
-		log_line("WARN", "Failed to send CLIENT_DELETE");
+	if (!send_message(fd, MessageType::MANAGER_DELETE, keys_payload)) {
+		log_line("WARN", "Failed to send MANAGER_DELETE");
 		close(fd);
 		return;
 	}
@@ -268,6 +300,98 @@ void GTStoreManager::delete_key_from_node(const vector<string> &keys, const Node
 		log_line("WARN", "Failed to receive delete response");
 	}
 	close(fd);
+}
+
+// This pauses a storage node (blocks client requests during rebalancing).
+bool GTStoreManager::pause_node(const NodeAddress &addr) {
+	int fd = connect_to_host(addr);
+	if (fd < 0) {
+		log_line("WARN", "Failed to connect to node for pause");
+		return false;
+	}
+	
+	if (!send_message(fd, MessageType::PAUSE_NODE, "")) {
+		log_line("WARN", "Failed to send PAUSE_NODE");
+		close(fd);
+		return false;
+	}
+	
+	MessageType type;
+	string response;
+	bool success = recv_message(fd, type, response) && type == MessageType::PAUSE_ACK;
+	close(fd);
+	
+	if (success) {
+		log_line("INFO", "Node paused successfully: " + addr.host + ":" + to_string(addr.port));
+	} else {
+		log_line("WARN", "Node did not ack pause");
+	}
+	return success;
+}
+
+// This resumes a storage node (allows client requests after rebalancing).
+bool GTStoreManager::resume_node(const NodeAddress &addr) {
+	int fd = connect_to_host(addr);
+	if (fd < 0) {
+		log_line("WARN", "Failed to connect to node for resume");
+		return false;
+	}
+	
+	if (!send_message(fd, MessageType::RESUME_NODE, "")) {
+		log_line("WARN", "Failed to send RESUME_NODE");
+		close(fd);
+		return false;
+	}
+	
+	MessageType type;
+	string response;
+	bool success = recv_message(fd, type, response) && type == MessageType::RESUME_ACK;
+	close(fd);
+	
+	if (success) {
+		log_line("INFO", "Node resumed successfully: " + addr.host + ":" + to_string(addr.port));
+	} else {
+		log_line("WARN", "Node did not ack resume");
+	}
+	return success;
+}
+
+// This waits for a node to become available (no ongoing PUTs with locks held).
+bool GTStoreManager::wait_for_availability(const NodeAddress &addr, int max_attempts) {
+	for (int attempt = 0; attempt < max_attempts; ++attempt) {
+		int fd = connect_to_host(addr);
+		if (fd < 0) {
+			log_line("WARN", "Failed to connect to node for availability check");
+			return false;
+		}
+
+		if (!send_message(fd, MessageType::AVAILABILITY_CHECK, "")) {
+			log_line("WARN", "Failed to send AVAILABILITY_CHECK");
+			close(fd);
+			return false;
+		}
+		
+		MessageType type;
+		string response;
+		if (!recv_message(fd, type, response) || type != MessageType::AVAILABLE_STATUS) {
+			log_line("WARN", "Failed to receive AVAILABLE_STATUS");
+			close(fd);
+			return false;
+		}
+		close(fd);
+		
+		if (response == "yes") {
+			log_line("INFO", "Node is available: " + addr.host + ":" + to_string(addr.port));
+			return true;
+		}
+		
+		// Node still has locks, wait and retry
+		log_line("INFO", "Node not yet available (attempt " + to_string(attempt + 1) + "/" + to_string(max_attempts) + "), waiting...");
+		this_thread::sleep_for(chrono::milliseconds(200));
+	}
+
+	log_line("WARN", "Node did not become available after " + to_string(max_attempts) + " attempts");
+	return false;
 }
 
 // This rebalances the keys after a node failure
@@ -335,6 +459,27 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 		keys_to_move[{primary_idx, kth_replica_idx}].push_back(key);
 	}
 	
+	set<int> affected_nodes;
+	for (const auto &entry : keys_to_move) {
+		affected_nodes.insert(entry.first.first);   // source
+		affected_nodes.insert(entry.first.second);  // destination
+	}
+	
+	// pause all affected nodes before rebalancing
+	log_line("INFO", "Pausing " + to_string(affected_nodes.size()) + " affected nodes for rebalancing");
+	for (int idx : affected_nodes) {
+		pause_node(nodes[idx].address);
+	}
+	
+	// wait for all affected nodes to become available
+	log_line("INFO", "Waiting for nodes to become available");
+	for (int idx : affected_nodes) {
+		if (!wait_for_availability(nodes[idx].address)) {
+			log_line("WARN", "Node idx=" + to_string(idx) + " did not become available");
+		}
+	}
+	log_line("INFO", "All nodes available, starting rebalancing operations");
+
 	for (const auto &entry : keys_to_move) {
 		int source_idx = entry.first.first;
 		int dest_idx = entry.first.second;
@@ -353,13 +498,26 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 		log_line("INFO", "Successfully moved " + to_string(keys.size()) + " keys");
 	}
 	
+	// resume affected nodes after rebalancing
+	log_line("INFO", "Resuming affected nodes after rebalancing");
+	for (int idx : affected_nodes) {
+		resume_node(nodes[idx].address);
+	}
+	
 	log_line("INFO", "Rebalancing complete for failed node at idx=" + to_string(failed_idx) + " token=" + to_string(failed_token));
 }
 
 // This rebalances the keys when a new node joins
-void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
+void GTStoreManager::rebalance_on_node_join(uint64_t new_token) {
 	vector<StorageNodeInfo> nodes = snapshot_nodes();
-	
+	int new_idx = -1;
+	for (size_t i = 0; i < nodes.size(); ++i) {
+		if (nodes[i].token == new_token) {
+			new_idx = (int)i;
+			break;
+		}
+	}
+
 	log_line("INFO", "Starting rebalancing for new node at idx=" + to_string(new_idx) + " token=" + to_string(new_token));
 	
 	// get keys from the immediate next node (it has all keys we might need to steal)
@@ -372,6 +530,9 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 	map<int, vector<string>> keys_to_copy;
 	// map: [old_kth_replica_idx] = {keys to delete}
 	map<int, vector<string>> keys_to_delete;
+	
+	set<int> affected_nodes;
+	affected_nodes.insert(next_idx);
 	
 	hash<string> hasher;
 	for (const auto &key : next_node_keys) {
@@ -404,12 +565,29 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 		}
 		
 		keys_to_copy[primary_idx].push_back(key);
+		affected_nodes.insert(primary_idx);
 		
 		// delete the key from the old K-th replica position (primary_idx + K)
 		int old_kth_replica_idx = (last_replica_idx + 1) % (int)nodes.size();
 		keys_to_delete[old_kth_replica_idx].push_back(key);
+		affected_nodes.insert(old_kth_replica_idx);
 	}
 	
+	// pause all affected nodes before rebalancing
+	log_line("INFO", "Pausing " + to_string(affected_nodes.size()) + " affected nodes for rebalancing");
+	for (int idx : affected_nodes) {
+		pause_node(nodes[idx].address);
+	}
+	
+	// wait for all affected nodes to become available (no ongoing PUTs)
+	log_line("INFO", "Waiting for nodes to become available");
+	for (int idx : affected_nodes) {
+		if (!wait_for_availability(nodes[idx].address)) {
+			log_line("WARN", "Node idx=" + to_string(idx) + " did not become available");
+		}
+	}
+	log_line("INFO", "All nodes available, starting rebalancing operations");
+
 	for (const auto &entry : keys_to_copy) {
 		int source_idx = entry.first;
 		const vector<string> &keys = entry.second;
@@ -436,6 +614,12 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 
 		log_line("INFO", "Deleting " + to_string(keys.size()) + " keys from old K-th replica idx=" + to_string(old_kth_replica_idx));
 		delete_key_from_node(keys, nodes[old_kth_replica_idx].address);
+	}
+	
+	// resume affected nodes after rebalancing
+	log_line("INFO", "Resuming affected nodes after rebalancing");
+	for (int idx : affected_nodes) {
+		resume_node(nodes[idx].address);
 	}
 	
 	log_line("INFO", "Rebalancing complete for new node at idx=" + to_string(new_idx) + " token=" + to_string(new_token));
@@ -491,6 +675,7 @@ void GTStoreManager::monitor_heartbeats() {
 		}
 		if (!removed.empty()) {
 			log_line("INFO", "Routing table snapshot: " + describe_table(snapshot_nodes()));
+			broadcast_table_to_storage_nodes();
 		}
 	}
 }

@@ -216,12 +216,7 @@ bool GTStoreClient::put(string key, val_t value) {
 			}
 		}
 		
-		size_t stored = 0;
-		StorageNodeInfo primary_node;
-		int primary_fd = -1;
-		bool printed_primary = false;
-		
-		// Send CLIENT_PUT to primary, REPL_PUT to replicas
+		// try all K replicas until one succeeds (that node becomes primary for chain replication)
 		for (size_t attempt = 0; attempt < replicas; ++attempt) {
 			StorageNodeInfo node = pick_node_for_attempt(key, attempt);
 			if (node.node_id.empty()) {
@@ -233,9 +228,6 @@ bool GTStoreClient::put(string key, val_t value) {
 			
 			size_t sep_pos = payload.find('|');
 			string value_slice = (sep_pos == string::npos) ? payload : payload.substr(sep_pos + 1);
-			
-			// use CLIENT_PUT for primary (attempt 0), REPL_PUT for replicas
-			MessageType put_type = (attempt == 0) ? MessageType::CLIENT_PUT : MessageType::REPL_PUT;
 			log_line("INFO", "put attempt key=" + key + " value=" + value_slice + " target=" + node.node_id);
 			int fd = connect_to_host(node.address);
 			if (fd < 0) {
@@ -243,61 +235,25 @@ bool GTStoreClient::put(string key, val_t value) {
 				refresh_table();
 				continue;
 			}
-			bool ok = send_message(fd, put_type, payload);
+			
+			bool ok = send_message(fd, MessageType::CLIENT_PUT, payload);
 			MessageType type;
 			string resp;
 			bool ack = ok && recv_message(fd, type, resp) && type == MessageType::PUT_OK;
-			
-			if (attempt == 0) {
-				// For primary, keep the connection open for REPL_CONFIRM
-				primary_node = node;
-				primary_fd = fd;
-			} else {
-				// For replicas, close the connection after PUT_OK
-				close(fd);
-			}
-			
+			close(fd);
+
 			if (ack) {
-				++stored;
+				cout << "OK, " << node.node_id << endl;
 				log_line("INFO", "put success key=" + key + " stored_on=" + node.node_id);
-				if (!printed_primary) {
-					cout << "OK, " << node.node_id << endl;
-					printed_primary = true;
-				}
+				return true;
 			} else {
-				if (attempt == 0) {
-					close(primary_fd);
-					primary_fd = -1;
-				}
+				log_line("WARN", "put failed on " + node.node_id + ", trying next replica");
 				refresh_table();
 			}
 		}
 		
-		// Check if we stored on all replicas
-		if (stored != replicas) {
-			log_line("WARN", "put stored on " + to_string(stored) + " of " + to_string(replicas) + " replicas");
-			if (primary_fd >= 0) {
-				close(primary_fd);
-			}
-			return false;
-		}
-		
-		// Send REPL_CONFIRM to primary on the same connection to release lock
-		if (primary_fd >= 0) {
-			bool ok = send_message(primary_fd, MessageType::REPL_CONFIRM, key);
-			MessageType type;
-			string resp;
-			bool ack = ok && recv_message(primary_fd, type, resp) && type == MessageType::PUT_OK;
-			close(primary_fd);
-			if (!ack) {
-				log_line("WARN", "put repl_confirm failed for " + primary_node.node_id);
-				return false;
-			}
-			log_line("INFO", "put replication confirmed for key=" + key);
-		}
-		
-		log_line("INFO", "put stored on " + to_string(stored) + " replicas");
-		return true;
+		log_line("ERROR", "put failed on " + to_string(replicas) + " replicas");
+		return false;
 }
 
 // This closes client side work.

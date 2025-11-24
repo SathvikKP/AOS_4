@@ -64,18 +64,22 @@ class GTStoreManager {
 		bool running;
 		void accept_loop();
 		bool send_table(int client_fd, const vector<StorageNodeInfo> &nodes, size_t replication_factor);
-		void handle_storage_register(const string &payload);
+		StorageNodeInfo handle_storage_register(const string &payload);
 		void handle_heartbeat(const string &payload);
 		vector<StorageNodeInfo> snapshot_nodes();
+		void broadcast_table_to_storage_nodes();
 		void monitor_heartbeats();
 		void rebalance_on_node_failure(int failed_idx, uint64_t failed_token, const vector<StorageNodeInfo> &nodes);
-		void rebalance_on_node_join(int new_idx, uint64_t new_token);
+		void rebalance_on_node_join(uint64_t new_token);
 		int find_node_index(const string &node_id) const;
 		vector<string> get_all_keys_from_node(const NodeAddress &addr);
 		void replicate_key_to_node(const vector<string> &keys, const vector<string> &values, const NodeAddress &dest_addr);
 		vector<string> get_key_from_node(const vector<string> &keys, const NodeAddress &addr);
 		void delete_key_from_node(const vector<string> &keys, const NodeAddress &addr);
 		void delete_key_from_node(const string &key, const NodeAddress &addr);
+		bool pause_node(const NodeAddress &addr);
+		bool resume_node(const NodeAddress &addr);
+		bool wait_for_availability(const NodeAddress &addr, int max_attempts = 30);
 	public:
 		void init();
 };
@@ -88,9 +92,12 @@ class GTStoreStorage {
 		unordered_map<string, string> kv_store;
 		string storage_id;
 		size_t replication_factor;
+		vector<StorageNodeInfo> routing_table;
 		thread heartbeat_thread;
 		bool running;
+		bool paused;
 		mutex lock_manager_mutex;
+		mutex pause_mutex;
 		unordered_map<string, string> key_locks;  // maps key -> client_id holding lock
 		bool register_with_manager();
 		void serve_clients();
