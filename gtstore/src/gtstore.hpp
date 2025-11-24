@@ -19,6 +19,7 @@
 #define MAX_VALUE_BYTE_PER_REQUEST 1000
 #define DEFAULT_MANAGER_HOST "127.0.0.1"
 #define DEFAULT_MANAGER_PORT 5000
+#define DEFAULT_STORAGE_HOST "127.0.0.1"
 #define DEFAULT_STORAGE_BASE_PORT 6000
 
 using namespace std;
@@ -80,8 +81,8 @@ class GTStoreManager {
 
 class GTStoreStorage {
 	private:
-		uint16_t listen_port;
 		NodeAddress addr;
+		NodeAddress manager_addr;
 		int listen_fd;
 		unordered_map<string, string> kv_store;
 		string storage_id;

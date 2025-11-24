@@ -18,18 +18,35 @@ using namespace std;
 void GTStoreManager::init() {
 	setup_logging("manager");
 	log_line("INFO", "Inside GTStoreManager::init()");
-	listen_port = DEFAULT_MANAGER_PORT;
-	replication_factor = 2;
-	running = true;
-	const char *env = std::getenv("GTSTORE_REPL");
+	char *env;
+
+	uint16_t manager_port = DEFAULT_MANAGER_PORT;
+	env = getenv("GTSTORE_MANAGER_PORT");
 	if (env) {
-		int parsed = std::atoi(env);
+		int parsed = atoi(env);
+		if (parsed >= 0 && parsed <= 65535) {
+			manager_port = static_cast<uint16_t>(parsed);
+		}
+	}
+
+	string manager_address = DEFAULT_MANAGER_HOST;
+	env = getenv("GTSTORE_MANAGER_HOST");
+	if (env) {
+		manager_address = string(env);
+	}
+	addr = NodeAddress{manager_address, manager_port};
+	
+	replication_factor = 1;
+	running = true;
+	env = getenv("GTSTORE_REPL");
+	if (env) {
+		int parsed = atoi(env);
 		if (parsed >= 1) {
 			replication_factor = static_cast<size_t>(parsed);
 		}
 	}
-	log_line("INFO", "Replication factor set to " + std::to_string(replication_factor));
-	NodeAddress addr{DEFAULT_MANAGER_HOST, listen_port};
+
+	log_line("INFO", "Replication factor set to " + to_string(replication_factor));
 	listen_fd = create_listen_socket(addr, BACKLOG);
 	if (listen_fd < 0) {
 		log_line("ERROR", "Failed to create manager listen socket");

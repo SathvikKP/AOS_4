@@ -6,33 +6,33 @@
 #include <thread>
 
 using namespace gtstore_utils;
+using namespace std;
 
 namespace {
-const std::string COMPONENT_PREFIX = "storage_";
+const string COMPONENT_PREFIX = "storage_";
 const int BACKLOG = 16;
 }
 
 // This tells manager about this storage node.
 bool GTStoreStorage::register_with_manager() {
-	NodeAddress manager_addr{DEFAULT_MANAGER_HOST, DEFAULT_MANAGER_PORT}; // maybe argument?
 	int fd = connect_to_host(manager_addr);
 	if (fd < 0) {
 		log_line("ERROR", "could not reach manager");
 		return false;
 	}
-	std::string payload = storage_id + ",127.0.0.1," + std::to_string(listen_port); // remember to mention fixed address to report
+	string payload = storage_id + "," + addr.host + "," + to_string(addr.port); // remember to mention fixed address to report
 	if (!send_message(fd, MessageType::STORAGE_REGISTER, payload)) {
 		log_line("ERROR", "failed to send register");
 		close(fd);
 		return false;
 	}
 	MessageType type;
-	std::string table_payload;
+	string table_payload;
 	if (recv_message(fd, type, table_payload) && type == MessageType::TABLE_PUSH) {
 		size_t parsed_factor = 1;
 		auto nodes = parse_table_payload(table_payload, parsed_factor);
 		replication_factor = parsed_factor;
-		log_line("INFO", "Received table with " + std::to_string(nodes.size()) + " nodes at replication " + std::to_string(replication_factor));
+		log_line("INFO", "Received table with " + to_string(nodes.size()) + " nodes at replication " + to_string(replication_factor));
 		close(fd);
 		return true;
 	}
@@ -43,8 +43,7 @@ bool GTStoreStorage::register_with_manager() {
 // This sends heartbeat messages to manager.
 void GTStoreStorage::heartbeat_loop() {
 	while (running) {
-		std::this_thread::sleep_for(std::chrono::seconds(2));
-		NodeAddress manager_addr{DEFAULT_MANAGER_HOST, DEFAULT_MANAGER_PORT};
+		this_thread::sleep_for(chrono::seconds(2));
 		int fd = connect_to_host(manager_addr);
 		if (fd < 0) {
 			continue;
@@ -54,31 +53,31 @@ void GTStoreStorage::heartbeat_loop() {
 			continue;
 		}
 		MessageType type;
-		std::string payload;
+		string payload;
 		recv_message(fd, type, payload); // TODO: remove HEARTBEAT_ACK handling?
 		close(fd);
 	}
 }
 
 // This checks the key size.
-bool GTStoreStorage::key_valid(const std::string &key) {
+bool GTStoreStorage::key_valid(const string &key) {
 	return !key.empty() && key.size() <= MAX_KEY_BYTE_PER_REQUEST;
 }
 
 // This checks the value size.
-bool GTStoreStorage::value_valid(const std::string &value) {
+bool GTStoreStorage::value_valid(const string &value) {
 	return value.size() <= MAX_VALUE_BYTE_PER_REQUEST;
 }
 
 // This stores a key locally.
-void GTStoreStorage::handle_put(int client_fd, const std::string &payload, bool is_primary) {
+void GTStoreStorage::handle_put(int client_fd, const string &payload, bool is_primary) {
 	auto pos = payload.find('|');
-	if (pos == std::string::npos) {
+	if (pos == string::npos) {
 		send_message(client_fd, MessageType::ERROR, "bad put");
 		return;
 	}
-	std::string key = payload.substr(0, pos);
-	std::string value = payload.substr(pos + 1);
+	string key = payload.substr(0, pos);
+	string value = payload.substr(pos + 1);
 	if (!key_valid(key)) {
 		send_message(client_fd, MessageType::ERROR, "bad key");
 		return;
@@ -89,7 +88,7 @@ void GTStoreStorage::handle_put(int client_fd, const std::string &payload, bool 
 	}
 	
 	// Only primary needs to acquire lock
-	std::string client_id = "client_" + std::to_string(client_fd);
+	string client_id = "client_" + to_string(client_fd);
 	if (is_primary) {
 		if (!try_acquire_lock(key, client_id)) {
 			send_message(client_fd, MessageType::ERROR, "locked");
@@ -108,7 +107,7 @@ void GTStoreStorage::handle_put(int client_fd, const std::string &payload, bool 
 	// Only primary waits for REPL_CONFIRM
 	if (is_primary) {
 		MessageType confirm_type;
-		std::string confirm_payload;
+		string confirm_payload;
 		if (recv_message(client_fd, confirm_type, confirm_payload) && 
 		    confirm_type == MessageType::REPL_CONFIRM) {
 			log_line("INFO", "Replication confirmed for key=" + key);
@@ -123,7 +122,7 @@ void GTStoreStorage::handle_put(int client_fd, const std::string &payload, bool 
 }
 
 // This reads a key locally.
-void GTStoreStorage::handle_get(int client_fd, const std::string &payload) {
+void GTStoreStorage::handle_get(int client_fd, const string &payload) {
 	if (!key_valid(payload)) {
 		send_message(client_fd, MessageType::ERROR, "bad key");
 		return;
@@ -139,7 +138,7 @@ void GTStoreStorage::handle_get(int client_fd, const std::string &payload) {
 }
 
 // This deletes a key locally.
-void GTStoreStorage::handle_delete(int client_fd, const std::string &payload) {
+void GTStoreStorage::handle_delete(int client_fd, const string &payload) {
 	if (!key_valid(payload)) {
 		send_message(client_fd, MessageType::ERROR, "bad key");
 		return;
@@ -163,9 +162,9 @@ void GTStoreStorage::serve_clients() {
 		if (client_fd < 0) {
 			continue;
 		}
-		std::thread([this, client_fd]() {
+		thread([this, client_fd]() {
 			MessageType type;
-			std::string payload;
+			string payload;
 			if (!recv_message(client_fd, type, payload)) {
 				close(client_fd);
 				return;
@@ -180,14 +179,14 @@ void GTStoreStorage::serve_clients() {
 				handle_delete(client_fd, payload);
 			} else if (type == MessageType::GET_ALL_KEYS) {
 				// Manager requesting all keys for rebalancing
-				std::string keys_payload;
+				string keys_payload;
 				for (const auto &entry : kv_store) {
 					if (!keys_payload.empty()) {
 						keys_payload += ",";
 					}
 					keys_payload += entry.first;
 				}
-				log_line("INFO", "GET_ALL_KEYS request: returning " + std::to_string(kv_store.size()) + " keys");
+				log_line("INFO", "GET_ALL_KEYS request: returning " + to_string(kv_store.size()) + " keys");
 				send_message(client_fd, MessageType::ALL_KEYS, keys_payload);
 			} else {
 				send_message(client_fd, MessageType::ERROR, "unknown");
@@ -201,39 +200,70 @@ void GTStoreStorage::serve_clients() {
 void GTStoreStorage::init() {
 	
 	cout << "Inside GTStoreStorage::init()\n";
-	listen_port = DEFAULT_STORAGE_BASE_PORT + (static_cast<uint16_t>(::getpid()) % 1000);
+	uint16_t storage_port = DEFAULT_STORAGE_BASE_PORT + (static_cast<uint16_t>(::getpid()) % 1000);
+	const char *port_env = getenv("GTSTORE_STORAGE_PORT");
+	if (port_env) {
+		int parsed = atoi(port_env);
+		if (parsed >= 0 && parsed <= 65535) {
+			storage_port = static_cast<uint16_t>(parsed);
+		}
+	}
+	string storage_addr = DEFAULT_STORAGE_HOST;
+	const char *addr_env = getenv("GTSTORE_STORAGE_HOST");
+	if (addr_env) {
+		storage_addr = string(addr_env);
+	}
+	addr = NodeAddress{storage_addr, storage_port};
+
+
+	const char *manager_host_env = getenv("GTSTORE_MANAGER_HOST");
+	string manager_host = DEFAULT_MANAGER_HOST;
+	if (manager_host_env) {
+		manager_host = string(manager_host_env);
+	}
+
+	const char *manager_port_env = getenv("GTSTORE_MANAGER_PORT");
+	uint16_t manager_port = DEFAULT_MANAGER_PORT;
+	if (manager_port_env) {
+		int parsed = atoi(manager_port_env);
+		if (parsed >= 0 && parsed <= 65535) {
+			manager_port = static_cast<uint16_t>(parsed);
+		}
+	}
+	manager_addr = NodeAddress{manager_host, manager_port};
+
 	if (!kv_store.empty()) {
 		kv_store.clear();
 	}
-	const char *label = std::getenv("GTSTORE_NODE_LABEL");
+	const char *label = getenv("GTSTORE_NODE_LABEL");
 	if (label && *label) {
 		storage_id = label;
 	} else {
-		storage_id = "node" + std::to_string(::getpid());
+		storage_id = "node" + to_string(::getpid());
 	}
 	replication_factor = 1;
 	running = true;
 	setup_logging(COMPONENT_PREFIX + storage_id);
 	log_line("INFO", "Storage label set to " + storage_id);
-	NodeAddress addr{"127.0.0.1", listen_port};
+	
 	listen_fd = create_listen_socket(addr, BACKLOG);
 	if (listen_fd < 0) {
 		log_line("ERROR", "storage listen failed");
 		return;
 	}
-	log_line("INFO", "Listening on " + addr.host + ":" + std::to_string(addr.port));
+	log_line("INFO", "Listening on " + addr.host + ":" + to_string(addr.port));
 	if (!register_with_manager()) {
 		log_line("ERROR", "storage registration with manager failed");
 		return;
 	}
-	heartbeat_thread = std::thread(&GTStoreStorage::heartbeat_loop, this);
+	heartbeat_thread = thread(&GTStoreStorage::heartbeat_loop, this);
 	heartbeat_thread.detach();
 	serve_clients();
 }
 
 // This prints every key/value in this storage.
 void GTStoreStorage::log_current_store() {
-	std::ostringstream out;
+	ostringstream out;
 	out << "Store snapshot on " << storage_id << ":";
 	for (const auto &entry : kv_store) {
 		out << " [" << entry.first << "=" << entry.second << "]";
@@ -243,7 +273,7 @@ void GTStoreStorage::log_current_store() {
 
 // This tries to acquire a write lock on a key.
 bool GTStoreStorage::try_acquire_lock(const string &key, const string &client_id) {
-	std::lock_guard<std::mutex> guard(lock_manager_mutex);
+	lock_guard<mutex> guard(lock_manager_mutex);
 	auto it = key_locks.find(key);
 	if (it != key_locks.end()) {
 		// Key is already locked by another client
@@ -256,7 +286,7 @@ bool GTStoreStorage::try_acquire_lock(const string &key, const string &client_id
 
 // This releases a write lock on a key.
 void GTStoreStorage::release_lock(const string &key) {
-	std::lock_guard<std::mutex> guard(lock_manager_mutex);
+	lock_guard<mutex> guard(lock_manager_mutex);
 	auto it = key_locks.find(key);
 	if (it != key_locks.end()) {
 		log_line("INFO", "Lock released for key=" + key + " by client=" + it->second);
