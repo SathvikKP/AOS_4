@@ -185,14 +185,20 @@ vector<string> GTStoreManager::get_all_keys_from_node(const NodeAddress &addr) {
 	return keys;
 }
 
-// This replicates a key-value pair to a specific node.
-void GTStoreManager::replicate_key_to_node(const string &key, const string &value, const NodeAddress &dest_addr) {
+// This replicates key-value pairs to a specific node.
+void GTStoreManager::replicate_key_to_node(const vector<string> &keys, const vector<string> &values, const NodeAddress &dest_addr) {
 	int fd = connect_to_host(dest_addr);
 	if (fd < 0) {
 		log_line("WARN", "Failed to connect to node for replication");
 		return;
 	}
-	string payload = key + "|" + value;
+
+	vector<string> kv_pairs;
+	for (size_t i = 0; i < keys.size(); ++i) {
+		kv_pairs.push_back(keys[i] + "|" + values[i]);
+	}
+	string payload = join(kv_pairs, ';');
+
 	// Use REPL_PUT for rebalancing (not CLIENT_PUT) since manager won't send REPL_CONFIRM
 	if (!send_message(fd, MessageType::REPL_PUT, payload)) {
 		log_line("WARN", "Failed to send REPL_PUT to node");
@@ -210,36 +216,48 @@ void GTStoreManager::replicate_key_to_node(const string &key, const string &valu
 	close(fd);
 }
 
-// This gets a single key-value pair from a specific node.
-string GTStoreManager::get_key_from_node(const string &key, const NodeAddress &addr) {
+// This gets key-value pairs from a specific node.
+vector<string> GTStoreManager::get_key_from_node(const vector<string> &keys, const NodeAddress &addr) {
 	int fd = connect_to_host(addr);
-	string value = "";
+	vector<string> values;
 	if (fd < 0) {
 		log_line("WARN", "Failed to connect to node for GET");
-		return value;
+		return values;
 	}
-	if (!send_message(fd, MessageType::CLIENT_GET, key)) {
+	
+	string keys_payload = join(keys, ';');
+	
+	if (!send_message(fd, MessageType::CLIENT_GET, keys_payload)) {
 		log_line("WARN", "Failed to send CLIENT_GET");
 		close(fd);
-		return value;
+		return values;
 	}
+	
 	MessageType type;
-	if (!recv_message(fd, type, value) || type != MessageType::GET_OK) {
+	string values_payload;
+	if (!recv_message(fd, type, values_payload) || type != MessageType::GET_OK) {
 		log_line("WARN", "Failed to receive GET response");
+		close(fd);
+		return values;
 	}
 	close(fd);
 
-	return value;
+
+	values = split(values_payload, ';');
+	return values;
 }
 
-// This deletes a key from a specific node.
-void GTStoreManager::delete_key_from_node(const string &key, const NodeAddress &addr) {
+// This deletes keys from a specific node.
+void GTStoreManager::delete_key_from_node(const vector<string> &keys, const NodeAddress &addr) {
 	int fd = connect_to_host(addr);
 	if (fd < 0) {
 		log_line("WARN", "Failed to connect to node for deletion");
 		return;
 	}
-	if (!send_message(fd, MessageType::CLIENT_DELETE, key)) {
+
+	string keys_payload = join(keys, ";");
+
+	if (!send_message(fd, MessageType::CLIENT_DELETE, keys_payload)) {
 		log_line("WARN", "Failed to send CLIENT_DELETE");
 		close(fd);
 		return;
@@ -277,6 +295,9 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 	unordered_set<string> all_keys(pred_keys.begin(), pred_keys.end());
 	all_keys.insert(succ_keys.begin(), succ_keys.end());
 	
+	// map to batch operations: [source_idx, dest_idx] = {keys}
+	map<pair<int, int>, vector<string>> keys_to_move;
+	
 	// for each key from both neighbors: rebalance if it's in the range that lost a replica
 	hash<string> hasher;
 	for (const auto &key : all_keys) {
@@ -311,15 +332,25 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 		// the K-th replica position for this key (which was on the failed node)
 		int kth_replica_idx = (primary_idx + (int)(replication_factor - 1)) % (int)nodes.size();
 		
-		// get the key-value pair from the primary node
-		string value = get_key_from_node(key, nodes[primary_idx].address);
-		if (value.empty()) {
-			log_line("WARN", "Failed to get key '" + key + "' from primary node idx=" + to_string(primary_idx));
+		keys_to_move[{primary_idx, kth_replica_idx}].push_back(key);
+	}
+	
+	for (const auto &entry : keys_to_move) {
+		int source_idx = entry.first.first;
+		int dest_idx = entry.first.second;
+		const vector<string> &keys = entry.second;
+		
+		log_line("INFO", "Moving " + to_string(keys.size()) + " keys from idx=" + to_string(source_idx) + " to idx=" + to_string(dest_idx));
+		
+		vector<string> values = get_key_from_node(keys, nodes[source_idx].address);
+		if (values.size() != keys.size()) {
+			log_line("WARN", "Failed to get all keys from source node");
 			continue;
 		}
-
-		log_line("INFO", "Rebalancing key '" + key + "' to node idx " + to_string(kth_replica_idx));
-		replicate_key_to_node(key, value, nodes[kth_replica_idx].address);
+		
+		replicate_key_to_node(keys, values, nodes[dest_idx].address);
+		
+		log_line("INFO", "Successfully moved " + to_string(keys.size()) + " keys");
 	}
 	
 	log_line("INFO", "Rebalancing complete for failed node at idx=" + to_string(failed_idx) + " token=" + to_string(failed_token));
@@ -336,6 +367,11 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 	vector<string> next_node_keys = get_all_keys_from_node(nodes[next_idx].address);
 	
 	log_line("INFO", "Querying next node idx=" + to_string(next_idx) + ", found " + to_string(next_node_keys.size()) + " keys");
+	
+	// map: [source_idx] = {keys to copy to new_idx}
+	map<int, vector<string>> keys_to_copy;
+	// map: [old_kth_replica_idx] = {keys to delete}
+	map<int, vector<string>> keys_to_delete;
 	
 	hash<string> hasher;
 	for (const auto &key : next_node_keys) {
@@ -367,21 +403,39 @@ void GTStoreManager::rebalance_on_node_join(int new_idx, uint64_t new_token) {
 			continue;
 		}
 		
-		// get the key-value pair from the primary node
-		string value = get_key_from_node(key, nodes[primary_idx].address);
-		if (value.empty()) {
-			log_line("WARN", "Failed to get key '" + key + "' from primary node idx=" + to_string(primary_idx));
-			continue;
-		}
-		
-		// put the key on the new node
-		log_line("INFO", "Moving key '" + key + "' to new node at idx " + to_string(new_idx));
-		replicate_key_to_node(key, value, nodes[new_idx].address);
+		keys_to_copy[primary_idx].push_back(key);
 		
 		// delete the key from the old K-th replica position (primary_idx + K)
 		int old_kth_replica_idx = (last_replica_idx + 1) % (int)nodes.size();
-		log_line("INFO", "Deleting key '" + key + "' from old K-th replica at idx " + to_string(old_kth_replica_idx));
-		delete_key_from_node(key, nodes[old_kth_replica_idx].address);
+		keys_to_delete[old_kth_replica_idx].push_back(key);
+	}
+	
+	for (const auto &entry : keys_to_copy) {
+		int source_idx = entry.first;
+		const vector<string> &keys = entry.second;
+		
+		if (keys.empty()) continue;
+		
+		log_line("INFO", "Moving " + to_string(keys.size()) + " keys from idx=" + to_string(source_idx) + " to new node idx=" + to_string(new_idx));
+		
+		vector<string> values = get_key_from_node(keys, nodes[source_idx].address);
+		if (values.size() != keys.size()) {
+			log_line("WARN", "Failed to get all keys from source node");
+			continue;
+		}
+		
+		replicate_key_to_node(keys, values, nodes[new_idx].address);
+		log_line("INFO", "Successfully moved " + to_string(keys.size()) + " keys");
+	}
+	
+	for (const auto &entry : keys_to_delete) {
+		int old_kth_replica_idx = entry.first;
+		const vector<string> &keys = entry.second;
+		
+		if (keys.empty()) continue;
+
+		log_line("INFO", "Deleting " + to_string(keys.size()) + " keys from old K-th replica idx=" + to_string(old_kth_replica_idx));
+		delete_key_from_node(keys, nodes[old_kth_replica_idx].address);
 	}
 	
 	log_line("INFO", "Rebalancing complete for new node at idx=" + to_string(new_idx) + " token=" + to_string(new_token));

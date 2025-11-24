@@ -69,36 +69,53 @@ bool GTStoreStorage::value_valid(const string &value) {
 	return value.size() <= MAX_VALUE_BYTE_PER_REQUEST;
 }
 
-// This stores a key locally.
+// This stores keys locally.
 void GTStoreStorage::handle_put(int client_fd, const string &payload, bool is_primary) {
-	auto pos = payload.find('|');
-	if (pos == string::npos) {
-		send_message(client_fd, MessageType::ERROR, "bad put");
-		return;
-	}
-	string key = payload.substr(0, pos);
-	string value = payload.substr(pos + 1);
-	if (!key_valid(key)) {
-		send_message(client_fd, MessageType::ERROR, "bad key");
-		return;
-	}
-	if (!value_valid(value)) {
-		send_message(client_fd, MessageType::ERROR, "bad value");
+	vector<string> pairs = split(payload, ';');
+	if (pairs.empty()) {
+		send_message(client_fd, MessageType::ERROR, "no pairs");
 		return;
 	}
 	
-	// Only primary needs to acquire lock
-	string client_id = "client_" + to_string(client_fd);
-	if (is_primary) {
-		if (!try_acquire_lock(key, client_id)) {
-			send_message(client_fd, MessageType::ERROR, "locked");
-			log_line("WARN", "PUT rejected key=" + key + " (locked) on " + storage_id);
+	vector<pair<string, string>> kv_pairs;
+	for (const auto &kv_pair : pairs) {
+		auto pos = kv_pair.find('|');
+		if (pos == string::npos) {
+			send_message(client_fd, MessageType::ERROR, "bad put format: " + kv_pair);
 			return;
 		}
+		string key = kv_pair.substr(0, pos);
+		string value = kv_pair.substr(pos + 1);
+
+		if (!key_valid(key)) {
+			send_message(client_fd, MessageType::ERROR, "bad key: " + key);
+			return;
+		}
+		if (!value_valid(value)) {
+			send_message(client_fd, MessageType::ERROR, "bad value for key: " + key);
+			return;
+		}
+		kv_pairs.push_back({key, value});
 	}
 	
-	log_line("INFO", "PUT key=" + key + " value=" + value + " on " + storage_id);
-	kv_store[key] = value;
+	// Only primary needs to acquire locks
+	string client_id = "client_" + to_string(client_fd);
+	vector<string> acquired_locks;
+	if (is_primary) {
+		for (const auto &kv_pair : kv_pairs) {
+			if (!try_acquire_lock(kv_pair.first, client_id)) {
+				send_message(client_fd, MessageType::ERROR, "locked: " + kv_pair.first);
+				log_line("WARN", "PUT rejected key=" + kv_pair.first + " (locked) on " + storage_id);
+				return;
+			}
+			acquired_locks.push_back(kv_pair.first);
+		}
+	}
+
+	for (const auto &kv_pair : kv_pairs) {
+		log_line("INFO", "PUT key=" + kv_pair.first + " value=" + kv_pair.second + " on " + storage_id);
+		kv_store[kv_pair.first] = kv_pair.second;
+	}
 	log_current_store();
 	
 	// Send PUT_OK
@@ -110,47 +127,81 @@ void GTStoreStorage::handle_put(int client_fd, const string &payload, bool is_pr
 		string confirm_payload;
 		if (recv_message(client_fd, confirm_type, confirm_payload) && 
 		    confirm_type == MessageType::REPL_CONFIRM) {
-			log_line("INFO", "Replication confirmed for key=" + key);
-			release_lock(key);
+			log_line("INFO", "Replication confirmed for " + to_string(kv_pairs.size()) + " key(s)");
+			for (const auto &key : acquired_locks) {
+				release_lock(key);
+			}
 			send_message(client_fd, MessageType::PUT_OK, "replicated");
 		} else {
-			log_line("WARN", "No replication confirmation for key=" + key);
-			release_lock(key);
+			log_line("WARN", "No replication confirmation for " + to_string(kv_pairs.size()) + " key(s)");
+			for (const auto &key : acquired_locks) {
+				release_lock(key);
+			}
 			send_message(client_fd, MessageType::ERROR, "no_confirmation");
 		}
 	}
 }
 
-// This reads a key locally.
+// This reads keys locally.
 void GTStoreStorage::handle_get(int client_fd, const string &payload) {
-	if (!key_valid(payload)) {
-		send_message(client_fd, MessageType::ERROR, "bad key");
+	vector<string> keys = split(payload, ';');
+	if (keys.empty()) {
+		send_message(client_fd, MessageType::ERROR, "no keys");
 		return;
 	}
-	auto it = kv_store.find(payload);
-	if (it == kv_store.end()) {
-		log_line("WARN", "GET miss key=" + payload + " on " + storage_id);
-		send_message(client_fd, MessageType::ERROR, "missing"); // this should happen only if key is not in gt store in general
-		return;
+	
+	for (const auto &key : keys) {
+		if (!key_valid(key)) {
+			send_message(client_fd, MessageType::ERROR, "bad key: " + key);
+			return;
+		}
 	}
-	log_line("INFO", "GET hit key=" + payload + " value=" + it->second + " on " + storage_id);
-	send_message(client_fd, MessageType::GET_OK, it->second);
+	
+	vector<string> values;
+	for (const auto &key : keys) {
+		auto it = kv_store.find(key);
+		if (it == kv_store.end()) {
+			log_line("WARN", "GET miss key=" + key + " on " + storage_id);
+			send_message(client_fd, MessageType::ERROR, "missing: " + key); // this should happen only if key is not in gt store in general
+			return;
+		}
+		log_line("INFO", "GET hit key=" + key + " value=" + it->second + " on " + storage_id);
+		values.push_back(it->second);
+	}
+	
+	string result;
+	for (size_t i = 0; i < values.size(); ++i) {
+		if (i > 0) result += ";";
+		result += values[i];
+	}
+	send_message(client_fd, MessageType::GET_OK, result);
 }
 
-// This deletes a key locally.
+// This deletes keys locally.
 void GTStoreStorage::handle_delete(int client_fd, const string &payload) {
-	if (!key_valid(payload)) {
-		send_message(client_fd, MessageType::ERROR, "bad key");
+	vector<string> keys = split(payload, ';');
+	if (keys.empty()) {
+		send_message(client_fd, MessageType::ERROR, "no keys");
 		return;
 	}
-	auto it = kv_store.find(payload);
-	if (it == kv_store.end()) {
-		log_line("WARN", "DELETE miss key=" + payload + " on " + storage_id);
-		send_message(client_fd, MessageType::DELETE_OK, "not_found");
-		return;
+
+	// validate all keys
+	for (const auto &key : keys) {
+		if (!key_valid(key)) {
+			send_message(client_fd, MessageType::ERROR, "bad key: " + key);
+			return;
+		}
 	}
-	log_line("INFO", "DELETE key=" + payload + " on " + storage_id);
-	kv_store.erase(it);
+	
+	for (const auto &key : keys) {
+		auto it = kv_store.find(key);
+		if (it == kv_store.end()) {
+			log_line("WARN", "DELETE miss key=" + key + " on " + storage_id);
+		} else {
+			log_line("INFO", "DELETE key=" + key + " on " + storage_id);
+			kv_store.erase(it);
+		}
+	}
 	log_current_store();
 	send_message(client_fd, MessageType::DELETE_OK, "ok");
 }

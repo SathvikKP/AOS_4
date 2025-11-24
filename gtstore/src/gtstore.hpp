@@ -72,8 +72,9 @@ class GTStoreManager {
 		void rebalance_on_node_join(int new_idx, uint64_t new_token);
 		int find_node_index(const string &node_id) const;
 		vector<string> get_all_keys_from_node(const NodeAddress &addr);
-		void replicate_key_to_node(const string &key, const string &value, const NodeAddress &dest_addr);
-		string get_key_from_node(const string &key, const NodeAddress &addr);
+		void replicate_key_to_node(const vector<string> &keys, const vector<string> &values, const NodeAddress &dest_addr);
+		vector<string> get_key_from_node(const vector<string> &keys, const NodeAddress &addr);
+		void delete_key_from_node(const vector<string> &keys, const NodeAddress &addr);
 		void delete_key_from_node(const string &key, const NodeAddress &addr);
 	public:
 		void init();
