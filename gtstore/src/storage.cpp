@@ -13,18 +13,18 @@ const int BACKLOG = 16;
 }
 
 // This tells manager about this storage node.
-void GTStoreStorage::register_with_manager() {
+bool GTStoreStorage::register_with_manager() {
 	NodeAddress manager_addr{DEFAULT_MANAGER_HOST, DEFAULT_MANAGER_PORT}; // maybe argument?
 	int fd = connect_to_host(manager_addr);
 	if (fd < 0) {
 		log_line("ERROR", "could not reach manager");
-		return;
+		return false;
 	}
 	std::string payload = storage_id + ",127.0.0.1," + std::to_string(listen_port); // remember to mention fixed address to report
 	if (!send_message(fd, MessageType::STORAGE_REGISTER, payload)) {
 		log_line("ERROR", "failed to send register");
 		close(fd);
-		return;
+		return false;
 	}
 	MessageType type;
 	std::string table_payload;
@@ -33,9 +33,11 @@ void GTStoreStorage::register_with_manager() {
 		auto nodes = parse_table_payload(table_payload, parsed_factor);
 		replication_factor = parsed_factor;
 		log_line("INFO", "Received table with " + std::to_string(nodes.size()) + " nodes at replication " + std::to_string(replication_factor));
-		// do not keep the table?
+		close(fd);
+		return true;
 	}
 	close(fd);
+	return false;
 }
 
 // This sends heartbeat messages to manager.
@@ -53,7 +55,7 @@ void GTStoreStorage::heartbeat_loop() {
 		}
 		MessageType type;
 		std::string payload;
-		recv_message(fd, type, payload); // if not ack, blocked?
+		recv_message(fd, type, payload); // TODO: remove HEARTBEAT_ACK handling?
 		close(fd);
 	}
 }
@@ -220,7 +222,10 @@ void GTStoreStorage::init() {
 		return;
 	}
 	log_line("INFO", "Listening on " + addr.host + ":" + std::to_string(addr.port));
-	register_with_manager(); // shouldnt we exit if it fails?
+	if (!register_with_manager()) {
+		log_line("ERROR", "storage registration with manager failed");
+		return;
+	}
 	heartbeat_thread = std::thread(&GTStoreStorage::heartbeat_loop, this);
 	heartbeat_thread.detach();
 	serve_clients();

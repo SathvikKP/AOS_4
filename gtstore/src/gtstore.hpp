@@ -15,12 +15,11 @@
 
 #include "net_common.hpp"
 
-const std::string DEFAULT_MANAGER_HOST = "127.0.0.1";
-const uint16_t DEFAULT_MANAGER_PORT = 5000;
-const uint16_t DEFAULT_STORAGE_BASE_PORT = 6000;
-
 #define MAX_KEY_BYTE_PER_REQUEST 20
 #define MAX_VALUE_BYTE_PER_REQUEST 1000
+#define DEFAULT_MANAGER_HOST "127.0.0.1"
+#define DEFAULT_MANAGER_PORT 5000
+#define DEFAULT_STORAGE_BASE_PORT 6000
 
 using namespace std;
 
@@ -42,26 +41,28 @@ class GTStoreClient {
 		bool validate_value(const val_t &value);
 	public:
 		GTStoreClient();
-		void init(int id);
+		void init(int id, const string &manager_host = DEFAULT_MANAGER_HOST, uint16_t manager_port = DEFAULT_MANAGER_PORT);
 		void finalize();
 		val_t get(string key);
 		bool put(string key, val_t value);
-		std::vector<StorageNodeInfo> current_table_snapshot() const;
-		StorageNodeInfo debug_pick_for_test(const std::string &key, size_t attempt);
+		vector<StorageNodeInfo> current_table_snapshot() const;
+		StorageNodeInfo debug_pick_for_test(const string &key, size_t attempt);
 		size_t current_replication() const;
 };
 
 class GTStoreManager {
 	private:
-		uint16_t listen_port;
+		NodeAddress addr;
 		int listen_fd;
 		vector<StorageNodeInfo> node_table;
 		size_t replication_factor;
-		std::mutex table_mutex;
-		std::unordered_map<std::string, std::chrono::steady_clock::time_point> heartbeat_times;
-		std::thread heartbeat_thread;
+		mutex node_table_mutex;
+		unordered_map<string, chrono::steady_clock::time_point> heartbeat_times;
+		mutex heartbeat_mutex;
+		thread heartbeat_thread;
 		bool running;
 		void accept_loop();
+		bool send_table(int client_fd, const vector<StorageNodeInfo> &nodes, size_t replication_factor);
 		void handle_storage_register(const string &payload);
 		void handle_heartbeat(const string &payload);
 		vector<StorageNodeInfo> snapshot_nodes();
@@ -71,8 +72,8 @@ class GTStoreManager {
 		int find_node_index(const string &node_id) const;
 		vector<string> get_all_keys_from_node(const NodeAddress &addr);
 		void replicate_key_to_node(const string &key, const string &value, const NodeAddress &dest_addr);
-		std::pair<bool, std::string> get_key_from_node(const std::string &key, const NodeAddress &addr);
-		void delete_key_from_node(const std::string &key, const NodeAddress &addr);
+		string get_key_from_node(const string &key, const NodeAddress &addr);
+		void delete_key_from_node(const string &key, const NodeAddress &addr);
 	public:
 		void init();
 };
@@ -80,21 +81,22 @@ class GTStoreManager {
 class GTStoreStorage {
 	private:
 		uint16_t listen_port;
+		NodeAddress addr;
 		int listen_fd;
 		unordered_map<string, string> kv_store;
 		string storage_id;
 		size_t replication_factor;
-		std::thread heartbeat_thread;
+		thread heartbeat_thread;
 		bool running;
-		std::mutex lock_manager_mutex;
+		mutex lock_manager_mutex;
 		unordered_map<string, string> key_locks;  // maps key -> client_id holding lock
-		void register_with_manager();
+		bool register_with_manager();
 		void serve_clients();
 		void handle_put(int client_fd, const string &payload, bool is_primary);
 		void handle_get(int client_fd, const string &payload);
 		void handle_delete(int client_fd, const string &payload);
-		bool key_valid(const std::string &key);
-		bool value_valid(const std::string &value);
+		bool key_valid(const string &key);
+		bool value_valid(const string &value);
 		void heartbeat_loop();
 		void log_current_store();
 		bool try_acquire_lock(const string &key, const string &client_id);

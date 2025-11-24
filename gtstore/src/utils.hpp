@@ -32,6 +32,9 @@ std::vector<StorageNodeInfo> parse_table_payload(const std::string &payload, siz
 // This reads a port value from argv.
 uint16_t read_port_from_arg(int argc, char **argv, uint16_t default_port);
 
+// This creates a readable string description of the routing table.
+std::string describe_table(const std::vector<StorageNodeInfo> &nodes);
+
 }
 
 #endif

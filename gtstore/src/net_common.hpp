@@ -9,7 +9,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-// NEWLY ADDED: shared message type ids
+// shared message type ids
 enum class MessageType : uint16_t {
     CLIENT_PUT = 1,
     CLIENT_GET = 2,
@@ -30,20 +30,20 @@ enum class MessageType : uint16_t {
     DELETE_OK = 17
 };
 
-// NEWLY ADDED: compact header carried before each payload
+// compact header carried before each payload
 struct MessageHeader {
     uint16_t type;
     uint16_t reserved;
     uint32_t payload_size;
 };
 
-// NEWLY ADDED: describes a TCP endpoint
+// describes a TCP endpoint
 struct NodeAddress {
     std::string host;
     uint16_t port;
 };
 
-// NEWLY ADDED: tracks a storage node entry
+// tracks a storage node entry
 struct StorageNodeInfo {
     std::string node_id;
     NodeAddress address;
