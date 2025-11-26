@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
+#include <set>
 
 using namespace gtstore_utils;
 using namespace std;
@@ -140,7 +142,7 @@ void GTStoreStorage::handle_put(int client_fd, const string &payload, bool is_pr
 		
 		// get primary index for first key to determine the k replicas
 		string first_key = kv_pairs[0].first;
-		uint64_t key_hash = hash<string>{}(first_key);
+		uint64_t key_hash = consistent_hash(first_key);
 		
 		int primary_idx = 0;
 		for (size_t i = 0; i < routing_table.size(); ++i) {
@@ -150,38 +152,44 @@ void GTStoreStorage::handle_put(int client_fd, const string &payload, bool is_pr
 			}
 		}
 		
-		size_t successful_replicas = 1;
-		for (size_t rep = 0; rep < replication_factor; ++rep) {
-			int replica_idx = (primary_idx + static_cast<int>(rep)) % static_cast<int>(routing_table.size());
-			if (replica_idx == cur_idx) {
-				continue; // skip self
-			}
+		unordered_set<string> unique_replicas;
+		unique_replicas.insert(routing_table[primary_idx].node_id);
+		cur_idx = (primary_idx + 1) % routing_table.size();
+
+		int prev_idx;
+		int successful_replicas = 1; // self is done
+		while (unique_replicas.size() < replication_factor) {
+			prev_idx = cur_idx;
+			cur_idx = (cur_idx + 1) % routing_table.size();
+			if (unique_replicas.find(routing_table[prev_idx].node_id) == unique_replicas.end()) {
+				unique_replicas.insert(routing_table[prev_idx].node_id);
+				const auto &replica_info = routing_table[prev_idx];
 			
-			const auto &replica_info = routing_table[replica_idx];
-			
-			int replica_fd = connect_to_host(replica_info.address);
-			if (replica_fd < 0) {
-				log_line("WARN", "Failed to connect to replica " + replica_info.node_id);
-				continue; // try next
-			}
-			
-			if (!send_message(replica_fd, MessageType::REPL_PUT, payload)) {
-				log_line("WARN", "Failed to send REPL_PUT to " + replica_info.node_id);
+				int replica_fd = connect_to_host(replica_info.address);
+				if (replica_fd < 0) {
+					log_line("WARN", "Failed to connect to replica " + replica_info.node_id);
+					continue; // try next
+				}
+				
+				if (!send_message(replica_fd, MessageType::REPL_PUT, payload)) {
+					log_line("WARN", "Failed to send REPL_PUT to " + replica_info.node_id);
+					close(replica_fd);
+					continue; // try next
+				}
+				
+				MessageType resp_type;
+				string resp_payload;
+				if (!recv_message(replica_fd, resp_type, resp_payload) || resp_type != MessageType::PUT_OK) {
+					log_line("WARN", "Replica " + replica_info.node_id + " did not confirm PUT");
+					close(replica_fd);
+					continue; // try next replica
+				}
+				
 				close(replica_fd);
-				continue; // try next
+				successful_replicas++;
+				log_line("INFO", "Replica " + replica_info.node_id + " confirmed PUT");
 			}
 			
-			MessageType resp_type;
-			string resp_payload;
-			if (!recv_message(replica_fd, resp_type, resp_payload) || resp_type != MessageType::PUT_OK) {
-				log_line("WARN", "Replica " + replica_info.node_id + " did not confirm PUT");
-				close(replica_fd);
-				continue; // try next replica
-			}
-			
-			close(replica_fd);
-			log_line("INFO", "Replica " + replica_info.node_id + " confirmed PUT");
-			++successful_replicas;
 		}
 		
 		// release locks

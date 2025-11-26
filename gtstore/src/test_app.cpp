@@ -7,6 +7,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace std;
@@ -168,6 +169,12 @@ void throughput_driver(int client_id, int total_ops) {
 	std::mt19937 rng(client_id);
 	std::uniform_int_distribution<int> pick(0, static_cast<int>(keys.size() - 1));
 	auto start = std::chrono::steady_clock::now();
+	for (size_t i = 0; i < keys.size(); ++i) {
+		val_t value;
+		value.push_back("tp_val_" + to_string(i));
+		client.put(keys[i], value);
+	}
+	
 	for (int i = 0; i < total_ops; ++i) {
 		string key = keys[pick(rng)];
 		if (i % 2 == 0) {
@@ -202,8 +209,12 @@ void load_balance_driver(int client_id, int inserts) {
 		return;
 	}
 	std::unordered_map<std::string, size_t> counts;
+	std::unordered_set<std::string> unique_nodes;
 	for (const auto &node : table) {
-		counts[node.node_id] = 0;
+		if (unique_nodes.find(node.node_id) == unique_nodes.end()) {
+			counts[node.node_id] = 0;
+			unique_nodes.insert(node.node_id);
+		}
 	}
 	for (int i = 0; i < inserts; ++i) {
 		string key = "lb_key_" + to_string(i);
@@ -213,11 +224,11 @@ void load_balance_driver(int client_id, int inserts) {
 		StorageNodeInfo owner = client.debug_pick_for_test(key, 0);
 		counts[owner.node_id] += 1;
 	}
-	for (const auto &node : table) {
+	for (const auto &node_id : unique_nodes) {
 		std::ostringstream line;
-		line << node.node_id << "," << counts[node.node_id];
+		line << node_id << "," << counts[node_id];
 		append_perf_line(line.str());
-		cout << "Load count for " << node.node_id << ": " << counts[node.node_id] << "\n";
+		cout << "Load count for " << node_id << ": " << counts[node_id] << "\n";
 	}
 	client.finalize();
 }

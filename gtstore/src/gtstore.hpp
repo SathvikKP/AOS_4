@@ -21,6 +21,7 @@
 #define DEFAULT_MANAGER_PORT 5000
 #define DEFAULT_STORAGE_HOST "127.0.0.1"
 #define DEFAULT_STORAGE_BASE_PORT 6000
+#define VNODES_PER_NODE 128
 
 using namespace std;
 
@@ -64,13 +65,13 @@ class GTStoreManager {
 		bool running;
 		void accept_loop();
 		bool send_table(int client_fd, const vector<StorageNodeInfo> &nodes, size_t replication_factor);
-		StorageNodeInfo handle_storage_register(const string &payload);
+		string handle_storage_register(const string &payload);
 		void handle_heartbeat(const string &payload);
 		vector<StorageNodeInfo> snapshot_nodes();
 		void broadcast_table_to_storage_nodes();
 		void monitor_heartbeats();
-		void rebalance_on_node_failure(int failed_idx, uint64_t failed_token, const vector<StorageNodeInfo> &nodes);
-		void rebalance_on_node_join(uint64_t new_token);
+		void rebalance_on_node_failure(const string &dead_physical_node_id, const vector<StorageNodeInfo> &nodes);
+		void rebalance_on_node_join(const string &new_physical_node_id);
 		int find_node_index(const string &node_id) const;
 		vector<string> get_all_keys_from_node(const NodeAddress &addr);
 		void replicate_key_to_node(const vector<string> &keys, const vector<string> &values, const NodeAddress &dest_addr);

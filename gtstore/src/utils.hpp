@@ -6,34 +6,42 @@
 
 #include "net_common.hpp"
 
+using namespace std;
+
 namespace gtstore_utils {
 
 // This sets up logging for the process.
-void setup_logging(const std::string &component_name);
+void setup_logging(const string &component_name);
 
 // This prints and writes a log line.
-void log_line(const std::string &level, const std::string &message);
+void log_line(const string &level, const string &message);
 
 // This splits a string by the delimiter.
-std::vector<std::string> split(const std::string &input, char delimiter);
+vector<string> split(const string &input, char delimiter);
 
 // This joins strings with the delimiter.
-std::string join(const std::vector<std::string> &parts, char delimiter);
+string join(const vector<string> &parts, char delimiter);
 
 // This trims whitespace from both ends.
-std::string trim(const std::string &value);
+string trim(const string &value);
 
 // This converts the storage table plus replication factor to a payload string.
-std::string build_table_payload(const std::vector<StorageNodeInfo> &nodes, size_t replication_factor);
+string build_table_payload(const vector<StorageNodeInfo> &nodes, size_t replication_factor);
 
 // This parses a payload back into storage entries and extracts replication factor.
-std::vector<StorageNodeInfo> parse_table_payload(const std::string &payload, size_t &replication_factor);
+vector<StorageNodeInfo> parse_table_payload(const string &payload, size_t &replication_factor);
+
+// This generates virtual tokens for a physical node.
+vector<uint64_t> generate_virtual_tokens(const string &physical_node_id, int num_vnodes);
+
+// This computes a consistent hash for a key (used for both virtual tokens and key hashing).
+uint64_t consistent_hash(const string &input);
 
 // This reads a port value from argv.
 uint16_t read_port_from_arg(int argc, char **argv, uint16_t default_port);
 
 // This creates a readable string description of the routing table.
-std::string describe_table(const std::vector<StorageNodeInfo> &nodes);
+string describe_table(const vector<StorageNodeInfo> &nodes);
 
 }
 

@@ -9,6 +9,7 @@
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <unordered_set>
 
 using namespace std;
 
@@ -150,14 +151,42 @@ string describe_table(const vector<StorageNodeInfo> &nodes) {
         return "<empty>";
     }
     ostringstream out;
+    unordered_set<string> seen_nodes;
+    bool first = true;
     for (size_t i = 0; i < nodes.size(); ++i) {
-        out << nodes[i].node_id << "@" << nodes[i].address.host << ":" << nodes[i].address.port
-            << " token=" << nodes[i].token;
-        if (i + 1 < nodes.size()) {
-            out << " | ";
+        if (seen_nodes.find(nodes[i].node_id) == seen_nodes.end()) {
+            if (!first) {
+                out << " | ";
+            }
+            out << nodes[i].node_id << "@" << nodes[i].address.host << ":" << nodes[i].address.port;
+            seen_nodes.insert(nodes[i].node_id);
+            first = false;
         }
     }
     return out.str();
+}
+
+// This computes a consistent hash for a key.
+uint64_t consistent_hash(const string &input) {
+    hash<string> str_hasher;
+    hash<uint64_t> int_hasher;
+    
+    uint64_t hash1 = str_hasher(input);
+    uint64_t hash2 = int_hasher(hash1);
+    
+    return hash2;
+}
+
+vector<uint64_t> generate_virtual_tokens(const string &physical_node_id, int num_vnodes) {
+    vector<uint64_t> tokens;
+    
+    for (int i = 0; i < num_vnodes; ++i) {
+        string token_seed = physical_node_id + "-" + to_string(i);
+        
+        uint64_t token = consistent_hash(token_seed);
+        tokens.push_back(token);
+    }
+    return tokens;
 }
 
 }

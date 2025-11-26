@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <functional>
 #include <sstream>
+#include <unordered_set>
 
 using namespace gtstore_utils;
 using namespace std;
@@ -24,9 +25,8 @@ StorageNodeInfo GTStoreClient::pick_node_for_attempt(const string &key, size_t a
 	if (routing_table.empty()) {
 		return StorageNodeInfo{"", {DEFAULT_MANAGER_HOST, DEFAULT_STORAGE_BASE_PORT}, 0};
 	}
-	hash<string> hasher;
-	uint64_t hash_value = hasher(key);
-	size_t start_index;
+	uint64_t hash_value = consistent_hash(key);
+	size_t start_index = routing_table.size();
 	for (size_t i = 0; i < routing_table.size(); ++i) {
 		if (hash_value <= routing_table[i].token) {
 			start_index = i;
@@ -36,7 +36,23 @@ StorageNodeInfo GTStoreClient::pick_node_for_attempt(const string &key, size_t a
 	if (start_index == routing_table.size()) {
 		start_index = 0; // wrap around
 	}
-	size_t index = (start_index + attempt) % routing_table.size();
+	
+	// skip vnodes with same physical node
+	unordered_set<string> used_physical_nodes;
+	size_t replicas_found = 0;
+	size_t index = start_index;
+	
+	while (replicas_found < attempt && replicas_found < routing_table.size()) {
+		if (used_physical_nodes.find(routing_table[index].node_id) == used_physical_nodes.end()) {
+			replicas_found++;
+			used_physical_nodes.insert(routing_table[index].node_id);
+		}
+		index = (index + 1) % routing_table.size();
+	}
+	if (attempt != 0){
+		index = (index - 1 + routing_table.size()) % routing_table.size(); // step back to last found
+	}
+
 	return routing_table[index];
 }
 

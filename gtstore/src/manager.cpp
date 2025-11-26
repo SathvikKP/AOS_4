@@ -82,11 +82,11 @@ void GTStoreManager::accept_loop() {
 			}
 				switch (type) {
 					case MessageType::STORAGE_REGISTER: {
-						StorageNodeInfo registered_node = handle_storage_register(payload);
+						string registered_node_id = handle_storage_register(payload);
 						send_table(client_fd, snapshot_nodes(), replication_factor);
 						close(client_fd);
 
-						rebalance_on_node_join(registered_node.token);
+						rebalance_on_node_join(registered_node_id);
 						broadcast_table_to_storage_nodes();
 						break;
 					}
@@ -107,42 +107,53 @@ void GTStoreManager::accept_loop() {
 }
 
 // This records a storage registration.
-StorageNodeInfo GTStoreManager::handle_storage_register(const string &payload) {
+string GTStoreManager::handle_storage_register(const string &payload) {
 	auto parts = gtstore_utils::split(payload, ',');
 	if (parts.size() != 3) {
 		log_line("WARN", "Invalid storage registration payload");
 		return {};
 	}
-	StorageNodeInfo info;
-	info.node_id = parts[0];
-	info.address.host = parts[1];
-	info.address.port = static_cast<uint16_t>(stoi(parts[2]));
-	hash<string> hasher;
-	string token_seed = info.node_id + "-" + info.address.host + ":" + to_string(info.address.port);
-	info.token = static_cast<uint64_t>(hasher(token_seed));
+	string node_id = parts[0];
+	NodeAddress address;
+	address.host = parts[1];
+	address.port = static_cast<uint16_t>(stoi(parts[2]));
+	
+	vector<uint64_t> virtual_tokens = generate_virtual_tokens(node_id, VNODES_PER_NODE);
+	
 	{
 		lock_guard<mutex> guard(node_table_mutex);
-		auto existing = find_if(node_table.begin(), node_table.end(), [&](const StorageNodeInfo &node) {
-			return node.node_id == info.node_id;
-		});
-		if (existing != node_table.end()) {
-			*existing = info;
-		} else {
-			node_table.push_back(info);
+		
+		// remove all old virtual nodes for this physical node
+		auto it = node_table.begin();
+		while (it != node_table.end()) {
+			if (it->node_id == node_id) {
+				it = node_table.erase(it);
+			} else {
+				++it;
+			}
 		}
 
+		for (int i = 0; i < VNODES_PER_NODE; ++i) {
+			StorageNodeInfo vnode;
+			vnode.node_id = node_id;
+			vnode.address = address;
+			vnode.token = virtual_tokens[i];
+			node_table.push_back(vnode);
+		}
 		{
 			lock_guard<mutex> hb_guard(heartbeat_mutex);
-			heartbeat_times[info.node_id] = chrono::steady_clock::now(); // TODO: what if same node.id?
+			heartbeat_times[node_id] = chrono::steady_clock::now();
 		}
 
 		sort(node_table.begin(), node_table.end(), [](const StorageNodeInfo &lhs, const StorageNodeInfo &rhs) {
 			return lhs.token < rhs.token;
 		});
 	}
-	log_line("INFO", "Registered storage " + info.node_id + " at " + info.address.host + ":" + to_string(info.address.port));
+	
+	log_line("INFO", "Registered storage " + node_id + " at " + address.host + ":" + to_string(address.port) + " with " + to_string(VNODES_PER_NODE) + " virtual nodes");
 	log_line("INFO", "Routing table snapshot: " + describe_table(snapshot_nodes()));
-	return info;
+
+	return node_id;
 }
 
 // This records heartbeat timestamps.
@@ -162,9 +173,15 @@ void GTStoreManager::broadcast_table_to_storage_nodes() {
 	auto nodes = snapshot_nodes();
 	string payload = build_table_payload(nodes, replication_factor);
 	
-	log_line("INFO", "Broadcasting routing table to " + to_string(nodes.size()) + " storage nodes");
+	unordered_set<string> broadcasted_nodes;
+	log_line("INFO", "Broadcasting routing table to storage nodes");
 	
 	for (const auto &node : nodes) {
+		if (broadcasted_nodes.find(node.node_id) != broadcasted_nodes.end()) {
+			continue;
+		}
+		broadcasted_nodes.insert(node.node_id);
+		
 		int fd = connect_to_host(node.address);
 		if (fd < 0) {
 			log_line("WARN", "Failed to connect to " + node.node_id + " for table broadcast");
@@ -395,38 +412,68 @@ bool GTStoreManager::wait_for_availability(const NodeAddress &addr, int max_atte
 }
 
 // This rebalances the keys after a node failure
-void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_token, const vector<StorageNodeInfo> &nodes) {
-	// nodes parameter is the post-failure snapshot (node already removed)
+void GTStoreManager::rebalance_on_node_failure(const string &failed_physical_node_id, const vector<StorageNodeInfo> &nodes) {
+	// nodes parameter is the pre-failure snapshot
 	if (nodes.empty()) {
 		log_line("WARN", "No nodes remaining after failure, aborting rebalance");
 		return;
 	}
 	
-	log_line("INFO", "Starting rebalancing for failed node at idx=" + to_string(failed_idx) + " token=" + to_string(failed_token));
-	
-	// find immediate predecessor and successor on the ring
-	// since the failed node is already removed, the successor is now at failed_idx (wrapping if needed)
-	int predecessor_idx = (failed_idx - 1 + (int)nodes.size()) % (int)nodes.size();
-	int successor_idx = failed_idx % (int)nodes.size();
-	int earliest_predecessor_idx = (failed_idx - (int)(replication_factor - 1) + (int)nodes.size()) % (int)nodes.size();
+	log_line("INFO", "Starting rebalancing for failed physical node: " + failed_physical_node_id);
 
-	log_line("INFO", "Querying immediate predecessor idx=" + to_string(predecessor_idx) + " and successor idx=" + to_string(successor_idx));
-	
-	vector<string> pred_keys = get_all_keys_from_node(nodes[predecessor_idx].address);
-	vector<string> succ_keys = get_all_keys_from_node(nodes[successor_idx].address);
-	log_line("INFO", "Predecessor has " + to_string(pred_keys.size()) + " keys, Successor has " + to_string(succ_keys.size()) + " keys");
-	
-	unordered_set<string> all_keys(pred_keys.begin(), pred_keys.end());
-	all_keys.insert(succ_keys.begin(), succ_keys.end());
-	
-	// map to batch operations: [source_idx, dest_idx] = {keys}
-	map<pair<int, int>, vector<string>> keys_to_move;
-	
-	// for each key from both neighbors: rebalance if it's in the range that lost a replica
-	hash<string> hasher;
-	for (const auto &key : all_keys) {
-		uint64_t key_hash = hasher(key);
+	set<string> query_nodes;  // physical node IDs that are predecessors
+	map<string, NodeAddress> node_to_address;
+	map<int, pair<int, int>> neighbor_vnodes;
+	// find immediate predecessor and successor for each failed vnode
+	for (int cur_idx = 0; cur_idx < (int)nodes.size(); ++cur_idx) {
+		if (nodes[cur_idx].node_id != failed_physical_node_id) {
+			continue;
+		}
 		
+		// immediate predecessor
+		int predecessor_idx = -1;
+		int idx = (cur_idx - 1 + (int)nodes.size()) % (int)nodes.size();
+		while (idx != cur_idx) {
+			if (nodes[idx].node_id != failed_physical_node_id) {
+				predecessor_idx = idx;
+				break;
+			}
+			idx = (idx - 1 + (int)nodes.size()) % (int)nodes.size();
+		}
+
+		// successor
+		int successor_idx = -1;
+		idx = (cur_idx + 1) % (int)nodes.size();
+		while (idx != cur_idx) {
+			if (nodes[idx].node_id != failed_physical_node_id) {
+				successor_idx = idx;
+				break;
+			}
+			idx = (idx + 1) % (int)nodes.size();
+		}
+		
+		neighbor_vnodes[cur_idx] = {predecessor_idx, successor_idx};
+		query_nodes.insert(nodes[predecessor_idx].node_id);
+		query_nodes.insert(nodes[successor_idx].node_id);
+		node_to_address[nodes[predecessor_idx].node_id] = nodes[predecessor_idx].address;
+		node_to_address[nodes[successor_idx].node_id] = nodes[successor_idx].address;
+	}
+
+	// collect keys from the nodes
+	unordered_set<string> all_keys;
+	for (const string &physical_node_id: query_nodes) {
+		vector<string> node_keys = get_all_keys_from_node(node_to_address[physical_node_id]);
+		all_keys.insert(node_keys.begin(), node_keys.end()); 
+	}
+	
+	// map to batch operations: [source_addr, dest_addr] = keys
+	// for each key from both neighbors: rebalance if it's in the range that lost a replica
+	map<pair<NodeAddress, NodeAddress>, vector<string>> keys_to_move;
+	set<NodeAddress> affected_nodes;
+	
+	for (const auto &key : all_keys) {
+		uint64_t key_hash = gtstore_utils::consistent_hash(key);
+
 		int primary_idx = -1;
 		for (size_t j = 0; j < nodes.size(); ++j) {
 			if (nodes[j].token >= key_hash) {
@@ -437,106 +484,138 @@ void GTStoreManager::rebalance_on_node_failure(int failed_idx, uint64_t failed_t
 		if (primary_idx < 0) {
 			primary_idx = 0; // wrap around
 		}
-		
-		// primary node of key should be within [predecessor_idx, successor_idx]
-		bool in_range = false;
-		if (primary_idx == successor_idx) {
-			in_range = (key_hash <= failed_token); // ignore next node's primary keys
-		} else if (earliest_predecessor_idx <= successor_idx) {
-			in_range = (primary_idx >= earliest_predecessor_idx && primary_idx < successor_idx);
-		} else {
-			// wrap around case
-			in_range = (primary_idx >= earliest_predecessor_idx || primary_idx < successor_idx);
+
+		// check if any of the k replicas were on the failed node
+		int k = 0;
+		int cur_idx = primary_idx;
+		int upper_limit = replication_factor;
+		int originator = (nodes[primary_idx].node_id != failed_physical_node_id) ? primary_idx : neighbor_vnodes[primary_idx].second;
+		set<string> seen_physical_nodes;
+		bool to_move = false;
+		while (k < upper_limit && k < (int)nodes.size()){
+			if (seen_physical_nodes.find(nodes[cur_idx].node_id) == seen_physical_nodes.end()){
+				seen_physical_nodes.insert(nodes[cur_idx].node_id);
+				if (nodes[cur_idx].node_id == failed_physical_node_id){
+					to_move = true;
+					upper_limit++; // need to check one more physical replica
+				}
+				k++;
+			}
+			cur_idx = (cur_idx + 1) % (int)nodes.size();
 		}
-		
-		if (!in_range) {
+		if (!to_move){
 			continue;
 		}
-		
-		// the K-th replica position for this key (which was on the failed node)
-		int kth_replica_idx = (primary_idx + (int)(replication_factor - 1)) % (int)nodes.size();
-		
-		keys_to_move[{primary_idx, kth_replica_idx}].push_back(key);
+
+		cur_idx = (cur_idx - 1 + (int)nodes.size()) % (int)nodes.size(); // step back to last replica
+		keys_to_move[{nodes[originator].address, nodes[cur_idx].address}].push_back(key);
 	}
-	
-	set<int> affected_nodes;
+
 	for (const auto &entry : keys_to_move) {
 		affected_nodes.insert(entry.first.first);   // source
 		affected_nodes.insert(entry.first.second);  // destination
 	}
-	
+		
 	// pause all affected nodes before rebalancing
 	log_line("INFO", "Pausing " + to_string(affected_nodes.size()) + " affected nodes for rebalancing");
-	for (int idx : affected_nodes) {
-		pause_node(nodes[idx].address);
+	for (const auto &addr : affected_nodes) {
+		pause_node(addr);
 	}
 	
 	// wait for all affected nodes to become available
 	log_line("INFO", "Waiting for nodes to become available");
-	for (int idx : affected_nodes) {
-		if (!wait_for_availability(nodes[idx].address)) {
-			log_line("WARN", "Node idx=" + to_string(idx) + " did not become available");
+	for (const auto &addr : affected_nodes) {
+		if (!wait_for_availability(addr)) {
+			log_line("WARN", "Node did not become available");
 		}
 	}
 	log_line("INFO", "All nodes available, starting rebalancing operations");
 
 	for (const auto &entry : keys_to_move) {
-		int source_idx = entry.first.first;
-		int dest_idx = entry.first.second;
+		NodeAddress source_addr = entry.first.first;
+		NodeAddress dest_addr = entry.first.second;
 		const vector<string> &keys = entry.second;
-		
-		log_line("INFO", "Moving " + to_string(keys.size()) + " keys from idx=" + to_string(source_idx) + " to idx=" + to_string(dest_idx));
-		
-		vector<string> values = get_key_from_node(keys, nodes[source_idx].address);
+
+		log_line("INFO", "Moving " + to_string(keys.size()) + " keys from " + source_addr.host + ":" + to_string(source_addr.port) + " to " + dest_addr.host + ":" + to_string(dest_addr.port));
+
+		vector<string> values = get_key_from_node(keys, source_addr);
 		if (values.size() != keys.size()) {
 			log_line("WARN", "Failed to get all keys from source node");
 			continue;
 		}
-		
-		replicate_key_to_node(keys, values, nodes[dest_idx].address);
-		
+
+		replicate_key_to_node(keys, values, dest_addr);
+
 		log_line("INFO", "Successfully moved " + to_string(keys.size()) + " keys");
 	}
 	
 	// resume affected nodes after rebalancing
 	log_line("INFO", "Resuming affected nodes after rebalancing");
-	for (int idx : affected_nodes) {
-		resume_node(nodes[idx].address);
+	for (const auto &addr : affected_nodes) {
+		resume_node(addr);
 	}
 	
-	log_line("INFO", "Rebalancing complete for failed node at idx=" + to_string(failed_idx) + " token=" + to_string(failed_token));
+	log_line("INFO", "Rebalancing complete for failed physical node: " + failed_physical_node_id);
 }
 
 // This rebalances the keys when a new node joins
-void GTStoreManager::rebalance_on_node_join(uint64_t new_token) {
+void GTStoreManager::rebalance_on_node_join(const string &new_node_id) {
 	vector<StorageNodeInfo> nodes = snapshot_nodes();
-	int new_idx = -1;
+	map<int, int> neighbor_vnodes;
+	// find all the vnodes for the new physical node
+	set<NodeAddress> successor_indices;
+	set<uint64_t> queue_indices;
+	set<NodeAddress> affected_nodes;
+	NodeAddress new_node_address;
+	bool to_find = false;
 	for (size_t i = 0; i < nodes.size(); ++i) {
-		if (nodes[i].token == new_token) {
-			new_idx = (int)i;
-			break;
+		if (nodes[i].node_id == new_node_id) {
+			new_node_address = nodes[i].address;
+			queue_indices.insert(i);
+			to_find = true;
+		}
+		if (to_find && nodes[i].node_id != new_node_id) {
+			successor_indices.insert(nodes[i].address);
+			for (uint64_t idx : queue_indices) {
+				neighbor_vnodes[idx] = i;
+			}
+			queue_indices.clear();
+			to_find = false;
+		}
+	}
+	if (to_find){
+		// wrap around case
+		for (uint64_t idx=0; idx < nodes.size(); ++idx){
+			if (nodes[idx].node_id != new_node_id){
+				successor_indices.insert(nodes[idx].address);
+				for (uint64_t q_idx : queue_indices) {
+					neighbor_vnodes[q_idx] = idx;
+				}
+				break;
+			}
 		}
 	}
 
-	log_line("INFO", "Starting rebalancing for new node at idx=" + to_string(new_idx) + " token=" + to_string(new_token));
+	log_line("INFO", "Starting rebalancing for new node with tokens: " + to_string(neighbor_vnodes.size()));
 	
-	// get keys from the immediate next node (it has all keys we might need to steal)
-	int next_idx = (new_idx + 1) % (int)nodes.size();
-	vector<string> next_node_keys = get_all_keys_from_node(nodes[next_idx].address);
-	
-	log_line("INFO", "Querying next node idx=" + to_string(next_idx) + ", found " + to_string(next_node_keys.size()) + " keys");
-	
+	// get keys from the immediate next nodes (it has all keys we might need to steal)
+	set<string> next_node_keys;
+
+	affected_nodes.insert(new_node_address);
+	for (const auto &addr : successor_indices) {
+		vector<string> keys = get_all_keys_from_node(addr);
+		next_node_keys.insert(keys.begin(), keys.end());
+	}
+
+	log_line("INFO", "Querying next nodes " + to_string(successor_indices.size()) + ", found " + to_string(next_node_keys.size()) + " keys");
+
 	// map: [source_idx] = {keys to copy to new_idx}
-	map<int, vector<string>> keys_to_copy;
+	map<NodeAddress, vector<string>> keys_to_copy;
 	// map: [old_kth_replica_idx] = {keys to delete}
-	map<int, vector<string>> keys_to_delete;
-	
-	set<int> affected_nodes;
-	affected_nodes.insert(next_idx);
-	
-	hash<string> hasher;
+	map<NodeAddress, vector<string>> keys_to_delete;
+		
 	for (const auto &key : next_node_keys) {
-		uint64_t key_hash = hasher(key);
+		uint64_t key_hash = gtstore_utils::consistent_hash(key);
 		
 		int primary_idx = -1;
 		for (size_t j = 0; j < nodes.size(); ++j) {
@@ -548,81 +627,87 @@ void GTStoreManager::rebalance_on_node_join(uint64_t new_token) {
 		if (primary_idx < 0) {
 			primary_idx = 0; // Wrap around
 		}
-		
-		// only steal keys if the new node is a replica for this key
-		// check if new_idx is in the replica range [primary_idx, primary_idx+K-1]
-		bool is_replica = false;
-		int last_replica_idx = (primary_idx + (int)(replication_factor - 1)) % (int)nodes.size();
-		if (primary_idx <= last_replica_idx) {
-			is_replica = (new_idx >= primary_idx && new_idx <= last_replica_idx);
-		} else {
-			// wrap around case
-			is_replica = (new_idx >= primary_idx || new_idx <= last_replica_idx);
+
+		// check if any of the k replicas are supposed to be on the new node
+		// if so, also find the k+1 to be removed
+		int k = 0;
+		int cur_idx = primary_idx;
+		int upper_limit = replication_factor;
+		int originator = (nodes[primary_idx].node_id != new_node_id) ? primary_idx : neighbor_vnodes[primary_idx];
+		set<string> seen_physical_nodes;
+		bool to_move = false;
+		while (k < upper_limit && k < (int)nodes.size()){
+			if (seen_physical_nodes.find(nodes[cur_idx].node_id) == seen_physical_nodes.end()){
+				seen_physical_nodes.insert(nodes[cur_idx].node_id);
+				if (nodes[cur_idx].node_id == new_node_id){
+					to_move = true;
+					upper_limit++; // need to check one more physical replica
+				}
+				k++;
+			}
+			cur_idx = (cur_idx + 1) % (int)nodes.size();
 		}
-		
-		if (!is_replica) {
+		if (!to_move){
 			continue;
 		}
-		
-		keys_to_copy[primary_idx].push_back(key);
-		affected_nodes.insert(primary_idx);
+
+		keys_to_copy[nodes[originator].address].push_back(key);
+		affected_nodes.insert(nodes[originator].address);
 		
 		// delete the key from the old K-th replica position (primary_idx + K)
-		int old_kth_replica_idx = (last_replica_idx + 1) % (int)nodes.size();
-		keys_to_delete[old_kth_replica_idx].push_back(key);
-		affected_nodes.insert(old_kth_replica_idx);
+		cur_idx = (cur_idx - 1 + (int)nodes.size()) % (int)nodes.size(); // step back to last replica
+		keys_to_delete[nodes[cur_idx].address].push_back(key);
+		affected_nodes.insert(nodes[cur_idx].address);
 	}
 	
 	// pause all affected nodes before rebalancing
 	log_line("INFO", "Pausing " + to_string(affected_nodes.size()) + " affected nodes for rebalancing");
-	for (int idx : affected_nodes) {
-		pause_node(nodes[idx].address);
+	for (const auto &addr : affected_nodes) {
+		pause_node(addr);
 	}
 	
 	// wait for all affected nodes to become available (no ongoing PUTs)
 	log_line("INFO", "Waiting for nodes to become available");
-	for (int idx : affected_nodes) {
-		if (!wait_for_availability(nodes[idx].address)) {
-			log_line("WARN", "Node idx=" + to_string(idx) + " did not become available");
+	for (const auto &addr : affected_nodes) {
+		if (!wait_for_availability(addr)) {
+			log_line("WARN", "Node " + addr.host + ":" + to_string(addr.port) + " did not become available");
 		}
 	}
 	log_line("INFO", "All nodes available, starting rebalancing operations");
 
 	for (const auto &entry : keys_to_copy) {
-		int source_idx = entry.first;
-		const vector<string> &keys = entry.second;
-		
-		if (keys.empty()) continue;
-		
-		log_line("INFO", "Moving " + to_string(keys.size()) + " keys from idx=" + to_string(source_idx) + " to new node idx=" + to_string(new_idx));
-		
-		vector<string> values = get_key_from_node(keys, nodes[source_idx].address);
-		if (values.size() != keys.size()) {
-			log_line("WARN", "Failed to get all keys from source node");
-			continue;
-		}
-		
-		replicate_key_to_node(keys, values, nodes[new_idx].address);
-		log_line("INFO", "Successfully moved " + to_string(keys.size()) + " keys");
-	}
-	
-	for (const auto &entry : keys_to_delete) {
-		int old_kth_replica_idx = entry.first;
 		const vector<string> &keys = entry.second;
 		
 		if (keys.empty()) continue;
 
-		log_line("INFO", "Deleting " + to_string(keys.size()) + " keys from old K-th replica idx=" + to_string(old_kth_replica_idx));
-		delete_key_from_node(keys, nodes[old_kth_replica_idx].address);
+		log_line("INFO", "Moving " + to_string(keys.size()) + " keys from addr=" + entry.first.host + ":" + to_string(entry.first.port) + " to new node addr=" + new_node_address.host + ":" + to_string(new_node_address.port));
+
+		vector<string> values = get_key_from_node(keys, entry.first);
+		if (values.size() != keys.size()) {
+			log_line("WARN", "Failed to get all keys from source node");
+			continue;
+		}
+
+		replicate_key_to_node(keys, values, new_node_address);
+		log_line("INFO", "Successfully moved " + to_string(keys.size()) + " keys");
+	}
+	
+	for (const auto &entry : keys_to_delete) {
+		const vector<string> &keys = entry.second;
+		
+		if (keys.empty()) continue;
+
+		log_line("INFO", "Deleting " + to_string(keys.size()) + " keys from old K-th replica addr=" + entry.first.host + ":" + to_string(entry.first.port));
+		delete_key_from_node(keys, entry.first);
 	}
 	
 	// resume affected nodes after rebalancing
 	log_line("INFO", "Resuming affected nodes after rebalancing");
-	for (int idx : affected_nodes) {
-		resume_node(nodes[idx].address);
+	for (const auto &addr : affected_nodes) {
+		resume_node(addr);
 	}
 	
-	log_line("INFO", "Rebalancing complete for new node at idx=" + to_string(new_idx) + " token=" + to_string(new_token));
+	log_line("INFO", "Rebalancing complete for new node with ID: " + new_node_id);
 }
 
 void GTStoreManager::monitor_heartbeats() {
@@ -630,50 +715,74 @@ void GTStoreManager::monitor_heartbeats() {
 	while (running) {
 		this_thread::sleep_for(chrono::seconds(2));
 		auto now = chrono::steady_clock::now();
+		
+		set<string> expired_physical_nodes;
 		vector<pair<string, long long>> removed;
+		vector<StorageNodeInfo> node_table_copy;
+		
 		{
 			lock_guard<mutex> guard(node_table_mutex);
-			auto it = node_table.begin();
-			while (it != node_table.end()) {
-				auto hb = heartbeat_times.find(it->node_id);
-				bool expired = false;
-				if (hb != heartbeat_times.end()) {
-					if (now - hb->second > timeout) {
-						expired = true;
-					}
-				} else {
+			node_table_copy = node_table;
+		}
+		
+		for (const auto &node : node_table_copy) {
+			auto hb = heartbeat_times.find(node.node_id);
+			bool expired = false;
+			
+			if (hb != heartbeat_times.end()) {
+				if (now - hb->second > timeout) {
 					expired = true;
 				}
-				if (expired) {
+			} else {
+				expired = true;
+			}
+			
+			if (expired) {
+				if (expired_physical_nodes.find(node.node_id) == expired_physical_nodes.end()) {
+					expired_physical_nodes.insert(node.node_id);
+					
 					long long seconds_since = -1;
 					if (hb != heartbeat_times.end()) {
 						seconds_since = chrono::duration_cast<chrono::seconds>(now - hb->second).count();
 					}
-					int dead_idx = static_cast<int>(distance(node_table.begin(), it));
-					uint64_t dead_token = it->token;
-					string dead_node_id = it->node_id;
-					removed.emplace_back(dead_node_id, seconds_since);
-					{
-						lock_guard<mutex> hb_guard(heartbeat_mutex);
-						heartbeat_times.erase(it->node_id);
-					}
-					it = node_table.erase(it);
-					log_line("WARN", "Node expired: " + dead_node_id + ", triggering rebalancing");
-					// call rebalancing while still holding the lock, passing the updated node table
-					rebalance_on_node_failure(dead_idx, dead_token, node_table);
-				} else {
-					++it;
+					removed.emplace_back(node.node_id, seconds_since);
+					
+					log_line("WARN", "Node expired: " + node.node_id + ", triggering rebalancing");
 				}
 			}
 		}
-		for (const auto &entry : removed) {
-			string msg = "Removed dead storage " + entry.first;
-			if (entry.second >= 0) {
-				msg += " after " + to_string(entry.second) + "s without heartbeat";
+		
+		if (!expired_physical_nodes.empty()) {
+			{
+				lock_guard<mutex> guard(node_table_mutex);
+				for (const auto &expired_node_id : expired_physical_nodes) {
+					rebalance_on_node_failure(expired_node_id, node_table);
+				}
+				
+				auto it = node_table.begin();
+				while (it != node_table.end()) {
+					if (expired_physical_nodes.find(it->node_id) != expired_physical_nodes.end()) {
+						it = node_table.erase(it);
+					} else {
+						++it;
+					}
+				}
 			}
-			log_line("WARN", msg);
-		}
-		if (!removed.empty()) {
+			{
+				lock_guard<mutex> hb_guard(heartbeat_mutex);
+				for (const auto &expired_node_id : expired_physical_nodes) {
+					heartbeat_times.erase(expired_node_id);
+				}
+			}
+			
+			for (const auto &entry : removed) {
+				string msg = "Removed dead storage " + entry.first;
+				if (entry.second >= 0) {
+					msg += " after " + to_string(entry.second) + "s without heartbeat";
+				}
+				log_line("WARN", msg);
+			}
+			
 			log_line("INFO", "Routing table snapshot: " + describe_table(snapshot_nodes()));
 			broadcast_table_to_storage_nodes();
 		}
