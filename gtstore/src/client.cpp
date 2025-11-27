@@ -37,23 +37,29 @@ StorageNodeInfo GTStoreClient::pick_node_for_attempt(const string &key, size_t a
 		start_index = 0; // wrap around
 	}
 	
-	// skip vnodes with same physical node
+	// walk forward and collect distinct physical nodes in order
 	unordered_set<string> used_physical_nodes;
-	size_t replicas_found = 0;
+	vector<StorageNodeInfo> unique_nodes;
+	size_t steps = 0;
 	size_t index = start_index;
-	
-	while (replicas_found < attempt && replicas_found < routing_table.size()) {
-		if (used_physical_nodes.find(routing_table[index].node_id) == used_physical_nodes.end()) {
-			replicas_found++;
-			used_physical_nodes.insert(routing_table[index].node_id);
+	while (steps < routing_table.size() && unique_nodes.size() <= attempt) {
+		const auto &candidate = routing_table[index];
+		if (used_physical_nodes.insert(candidate.node_id).second) {
+			unique_nodes.push_back(candidate);
+			if (unique_nodes.size() > attempt) {
+				break; // we already have the requested attempt slot
+			}
 		}
 		index = (index + 1) % routing_table.size();
+		steps++;
 	}
-	if (attempt != 0){
-		index = (index - 1 + routing_table.size()) % routing_table.size(); // step back to last found
+	if (unique_nodes.empty()) {
+		return routing_table[start_index];
 	}
-
-	return routing_table[index];
+	if (attempt >= unique_nodes.size()) {
+		return unique_nodes.back();
+	}
+	return unique_nodes[attempt];
 }
 
 // This turns payload into value list.

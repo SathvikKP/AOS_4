@@ -5,7 +5,7 @@ RM      = /bin/rm -rf
 BIN_DIR = bin
 COMMON_SRC = src/net_common.cpp src/utils.cpp
 
-TESTS = test_app manager storage
+TESTS = test_app manager storage client
 CLIENT_SRC = src/test_app.cpp src/client.cpp
 
 all: $(TESTS)
@@ -21,6 +21,9 @@ storage: src/storage.cpp $(COMMON_SRC) | $(BIN_DIR)
 
 test_app: $(CLIENT_SRC) $(COMMON_SRC) | $(BIN_DIR)
 	$(CC) -Wall $(CLIENT_SRC) $(COMMON_SRC) -o $(BIN_DIR)/test_app
+
+client: src/client_cli.cpp src/client.cpp $(COMMON_SRC) | $(BIN_DIR)
+	$(CC) -Wall src/client_cli.cpp src/client.cpp $(COMMON_SRC) -o $(BIN_DIR)/client
 
 clean:
 	$(RM) *.o $(BIN_DIR)
